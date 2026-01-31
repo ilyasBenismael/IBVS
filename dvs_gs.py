@@ -1,3 +1,4 @@
+import pycolmap
 import torch
 import numpy as np
 from plyfile import PlyData
@@ -9,6 +10,7 @@ import math
 from datetime import datetime
 from utils.visualizer import LiveOptimizationVisualizer
 import open3d as o3d
+
 
 
 
@@ -64,73 +66,105 @@ def move_points_with_camera(points_world, T_wc):
 
 
 
-def load_gaussians_from_ply(ply_path, device="cuda"):
-    ply = PlyData.read(ply_path)
-    v = ply["vertex"].data
 
-    N = v.shape[0]
-    print(N)
+def load_gaussians_from_ply(path, device="cuda"):
 
+    # Read PLY
+    ply = PlyData.read(path)["vertex"]
+    N = ply.count
+    print(f"Loaded {N} vertices from {path}\n")
 
-    # Positions
+    # -----------------------
+    # Means
+    # -----------------------
     means = torch.stack([
-        torch.from_numpy(v["x"]),
-        torch.from_numpy(v["y"]),
-        torch.from_numpy(v["z"]),
-    ], dim=1).float()
+        torch.from_numpy(ply["x"]),
+        torch.from_numpy(ply["y"]),
+        torch.from_numpy(ply["z"]),
+    ], dim=1).float().to(device)
 
+    print("=== Means (first point) ===")
+    print(means[0])
 
-    # Rotations
-    quats = torch.stack([
-        torch.from_numpy(v["rot_0"]),
-        torch.from_numpy(v["rot_1"]),
-        torch.from_numpy(v["rot_2"]),
-        torch.from_numpy(v["rot_3"]),
-    ], dim=1).float()
-
-    quats = quats / quats.norm(dim=1, keepdim=True)
-
-
-    # Scales
+    # -----------------------
+    # Scales (log → real)
+    # -----------------------
     scales_log = torch.stack([
-        torch.from_numpy(v["scale_0"]),
-        torch.from_numpy(v["scale_1"]),
-        torch.from_numpy(v["scale_2"]),
-    ], dim=1).float()
+        torch.from_numpy(ply["scale_0"]),
+        torch.from_numpy(ply["scale_1"]),
+        torch.from_numpy(ply["scale_2"]),
+    ], dim=1).float().to(device)
+    print("=== Scales log (first point) ===")
+    print(scales_log[0])
 
     scales = torch.exp(scales_log)
-    scales = scales.clamp(1e-4, 0.05)
+    print("=== Scales exp (first point) ===")
+    print(scales[0])
+
+    # -----------------------
+    # Rotation (normalize quaternion)
+    # -----------------------
+    quats = torch.stack([
+        torch.from_numpy(ply["rot_0"]),
+        torch.from_numpy(ply["rot_1"]),
+        torch.from_numpy(ply["rot_2"]),
+        torch.from_numpy(ply["rot_3"]),
+    ], dim=1).float().to(device)
+
+    print("=== Quats raw (first point) ===")
+    print(quats[0])
+
+    quats = quats / torch.norm(quats, dim=1, keepdim=True)
+    print("=== Quats normalized (first point) ===")
+    print(quats[0])
+
+    # -----------------------
+    # Opacity (inverse sigmoid → alpha)
+    # -----------------------
+    opacity_param = torch.from_numpy(ply["opacity"]).float().to(device)
+    print("=== Opacity param (logit) (first point) ===")
+    print(opacity_param[0])
+
+    opacities = torch.sigmoid(opacity_param)
+    print("=== Opacity alpha (sigmoid) (first point) ===")
+    print(opacities[0])
+
+    # -----------------------
+    # Spherical Harmonics
+    # -----------------------
+    f_dc = torch.stack([
+        torch.from_numpy(ply["f_dc_0"]),
+        torch.from_numpy(ply["f_dc_1"]),
+        torch.from_numpy(ply["f_dc_2"]),
+    ], dim=1)
+    print("=== SH f_dc (first point) ===")
+    print(f_dc[0])
+    
+    # Compute number of rest coefficients
+    ply_data = ply.data  # <-- access the structured array
+    rest_keys = [k for k in ply_data.dtype.names if k.startswith("f_rest_")]
+
+    f_rest = torch.stack([
+        torch.from_numpy(ply_data[k]) for k in rest_keys
+    ], dim=1)
+
+    print("=== SH f_rest (first 5 coefficients, first point) ===")
+    print(f_rest[0, :15])  # first 5 rest coeffs (5*3=15)
+
+    sh = torch.cat([f_dc, f_rest], dim=1)   # (N, num_coeffs*3)
+    sh = sh.view(N, -1, 3).float().to(device)
+
+    print("=== SH final shape ===")
+    print(sh.shape)
+    print("=== SH first point all coefficients ===")
+    print(sh[0])
 
 
-    # Opacity
-    opacities = torch.sigmoid(
-        torch.from_numpy(v["opacity"]).float()
-    )
+    return means, quats, scales, opacities, sh
 
 
-    # SH coefficients
-    f_rest_cols = [k for k in v.dtype.names if k.startswith("f_rest_")]
-    num_rest = len(f_rest_cols) // 3
-    num_coeffs = 1 + num_rest
 
-    sh = torch.zeros((N, num_coeffs, 3), dtype=torch.float32)
 
-    sh[:, 0, 0] = torch.from_numpy(v["f_dc_0"])
-    sh[:, 0, 1] = torch.from_numpy(v["f_dc_1"])
-    sh[:, 0, 2] = torch.from_numpy(v["f_dc_2"])
-
-    for i in range(num_rest):
-        sh[:, i + 1, 0] = torch.from_numpy(v[f"f_rest_{3*i+0}"])
-        sh[:, i + 1, 1] = torch.from_numpy(v[f"f_rest_{3*i+1}"])
-        sh[:, i + 1, 2] = torch.from_numpy(v[f"f_rest_{3*i+2}"])
-
-    return (
-        means.to(device),
-        quats.to(device),
-        scales.to(device),
-        opacities.to(device),
-        sh.to(device),
-    )
 
 
 
@@ -372,8 +406,9 @@ def main() :
     # 1 - loading my scene :
     means, quats, scales, opacities, sh = load_gaussians_from_ply(path)
 
+    return
 
-    # 3 - defining desired cam T 
+    # 2 - defining desired cam T 
     T_1 = get_homog([-1, 2, 5, 0, 0, 0])
     T_2 = get_homog([0, 0, 0, 0, -1.1*np.pi, 0])
     T_3 = get_homog([0, 0, 0, 0, 0, -np.pi])
@@ -381,7 +416,7 @@ def main() :
     des_T = T_1 @ T_2 @ T_3 @ T_4 #homog of camera frame relatively to world frame
     des_viewmat = make_viewmat(des_T) #tensor of homog of world frame relatively to camera frame
 
-    # 4 defining initial cam T
+    # 3 defining initial cam T
     T_1 = get_homog([0.7, -0.5, -0.6, np.pi/25, np.pi/20, 0])
     cur_T = des_T @ T_1
 

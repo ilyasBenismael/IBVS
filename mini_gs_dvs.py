@@ -1,15 +1,17 @@
+import pycolmap
 import torch
 import numpy as np
-from plyfile import PlyData, PlyElement
-from lin_algeb import LinAlgeb
+from plyfile import PlyData
+from utils.lin_algeb import LinAlgeb
 import matplotlib.pyplot as plt
 from gsplat import rasterization
 import cv2
 import math
 from datetime import datetime
-from visualizer import LiveOptimizationVisualizer
-from moge.model.v2 import MoGeModel
+from utils.visualizer import LiveOptimizationVisualizer
 import open3d as o3d
+
+
 
 
 
@@ -18,7 +20,7 @@ import open3d as o3d
 
 #_____ parameters
 
-CAM_W, CAM_H = 700, 600
+CAM_W, CAM_H = 1500, 1000
 FX = FY = 0.8 * max(CAM_W, CAM_H)
 f=1
 CX, CY = CAM_W / 2.0, CAM_H / 2.0
@@ -33,8 +35,10 @@ Ks = torch.tensor(
 
 dt = 0.4
 lamda = 0.1
-path = "desk.ply"
-img_path = "indoor.jpeg"
+path = "scenes/mini_office_gs.ply"
+
+
+
 
 
 
@@ -50,150 +54,83 @@ def get_homog(pose_vector) :
 
 
 
-def move_points_with_camera(points_world, T_wc):
-    # moves points in the WORLD frame so that: new_camera_coordinates == old_world_coordinates
-    #which is done with a direct transformation
-    H, W, _ = points_world.shape
+def load_gaussians_from_ply(path, device="cuda"):
 
-    R_wc = T_wc[:3, :3]
-    t_wc = T_wc[:3, 3]
+    # Read PLY
+    ply = PlyData.read(path)["vertex"]
+    N = ply.count
+    print(f"Loaded {N} vertices from {path}\n")
 
-    Pw = points_world.reshape(-1, 3).T   # (3, N)
-
-    # DIRECT transform (camera → world)
-    Pw_new = R_wc @ Pw + t_wc[:, None]
-
-    return Pw_new.T.reshape(H, W, 3)
-
-
-
-
-
-def load_points(img_path, cam_homog) :
-
-    # Load MoGe-2 model
-    device = "cuda"
-    model = MoGeModel.from_pretrained(
-        "Ruicheng/moge-2-vitl-normal"
-    ).to(device)
-    model.eval()
-
-
-    # Load RGB image
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    image = torch.tensor(
-        img / 255.0,
-        dtype=torch.float32,
-        device=device
-    ).permute(2, 0, 1)
-
-
-    # Run MoGe-2 inference and get points
-    output = model.infer(image)
-    old_points_world = output["points"]   # (H, W, 3(xyz))  metric 3D points
-    mask   = output["mask"]     # (H, W, 1(Bool)) trusted pixels
-    old_points_world = old_points_world.cpu().numpy()
-    mask   = mask.cpu().numpy()
-
-    # translate points in front of current frame, the old world points coords are now the points coords in cam
-    points_world = move_points_with_camera(old_points_world, cam_homog)
-    points_cam = old_points_world
-
-    # Get colors of each pixel of img to color the points
-    colors = img.astype(np.float32) / 255.0
-
-    # Flatening things
-    pts     = points_world.reshape(-1, 3)
-    clrs  = colors.reshape(-1, 3)
-    valid   = mask.reshape(-1) > 0
-
-    # Create Open3D point cloud with only valid points
-    points_o3d = o3d.geometry.PointCloud()
-    points_o3d.points = o3d.utility.Vector3dVector(pts[valid])
-    points_o3d.colors = o3d.utility.Vector3dVector(clrs[valid])
-    return points_o3d, points_world, points_cam, colors
-
-
-
-
-
-def load_gaussians_from_ply(ply_path, device="cuda"):
-    ply = PlyData.read(ply_path)
-    v = ply["vertex"].data
-
-    N = v.shape[0]
-    print(N)
-
-
-    # Positions
+    # -----------------------
+    # Means
+    # -----------------------
     means = torch.stack([
-        torch.from_numpy(v["x"]),
-        torch.from_numpy(v["y"]),
-        torch.from_numpy(v["z"]),
-    ], dim=1).float()
+        torch.from_numpy(ply["x"]),
+        torch.from_numpy(ply["y"]),
+        torch.from_numpy(ply["z"]),
+    ], dim=1).float().to(device)
 
-
-    # Rotations
-    quats = torch.stack([
-        torch.from_numpy(v["rot_0"]),
-        torch.from_numpy(v["rot_1"]),
-        torch.from_numpy(v["rot_2"]),
-        torch.from_numpy(v["rot_3"]),
-    ], dim=1).float()
-
-    quats = quats / quats.norm(dim=1, keepdim=True)
-
-
-    # Scales
+    # -----------------------
+    # Scales (log → real)
+    # -----------------------
     scales_log = torch.stack([
-        torch.from_numpy(v["scale_0"]),
-        torch.from_numpy(v["scale_1"]),
-        torch.from_numpy(v["scale_2"]),
-    ], dim=1).float()
-
+        torch.from_numpy(ply["scale_0"]),
+        torch.from_numpy(ply["scale_1"]),
+        torch.from_numpy(ply["scale_2"]),
+    ], dim=1).float().to(device)
     scales = torch.exp(scales_log)
-    scales = scales.clamp(1e-4, 0.05)
+
+    # -----------------------
+    # Rotation (normalize quaternion)
+    # -----------------------
+    quats = torch.stack([
+        torch.from_numpy(ply["rot_0"]),
+        torch.from_numpy(ply["rot_1"]),
+        torch.from_numpy(ply["rot_2"]),
+        torch.from_numpy(ply["rot_3"]),
+    ], dim=1).float().to(device)
+    quats = quats / torch.norm(quats, dim=1, keepdim=True)
 
 
-    # Opacity
-    opacities = torch.sigmoid(
-        torch.from_numpy(v["opacity"]).float()
-    )
+    # -----------------------
+    # Opacity (inverse sigmoid → alpha)
+    # -----------------------
+    opacity_param = torch.from_numpy(ply["opacity"]).float().to(device)
+    opacities = torch.sigmoid(opacity_param)
+
+    # -----------------------
+    # Spherical Harmonics
+    # -----------------------
+    f_dc = torch.stack([
+        torch.from_numpy(ply["f_dc_0"]),
+        torch.from_numpy(ply["f_dc_1"]),
+        torch.from_numpy(ply["f_dc_2"]),
+    ], dim=1)
+
+    # Compute number of rest coefficients
+    ply_data = ply.data  # <-- access the structured array
+    rest_keys = [k for k in ply_data.dtype.names if k.startswith("f_rest_")]
+
+    f_rest = torch.stack([
+        torch.from_numpy(ply_data[k]) for k in rest_keys
+    ], dim=1)
 
 
-    # SH coefficients
-    f_rest_cols = [k for k in v.dtype.names if k.startswith("f_rest_")]
-    num_rest = len(f_rest_cols) // 3
-    num_coeffs = 1 + num_rest
+    sh = torch.cat([f_dc, f_rest], dim=1)   # (N, num_coeffs*3)
+    sh = sh.view(N, -1, 3).float().to(device)
 
-    sh = torch.zeros((N, num_coeffs, 3), dtype=torch.float32)
 
-    sh[:, 0, 0] = torch.from_numpy(v["f_dc_0"])
-    sh[:, 0, 1] = torch.from_numpy(v["f_dc_1"])
-    sh[:, 0, 2] = torch.from_numpy(v["f_dc_2"])
 
-    for i in range(num_rest):
-        sh[:, i + 1, 0] = torch.from_numpy(v[f"f_rest_{3*i+0}"])
-        sh[:, i + 1, 1] = torch.from_numpy(v[f"f_rest_{3*i+1}"])
-        sh[:, i + 1, 2] = torch.from_numpy(v[f"f_rest_{3*i+2}"])
 
-    return (
-        means.to(device),
-        quats.to(device),
-        scales.to(device),
-        opacities.to(device),
-        sh.to(device),
-    )
+    return means, quats, scales, opacities, sh
 
 
 
 
 
 def make_viewmat(T_wc, device="cuda"):
-    T_wc = torch.tensor(T_wc, dtype=torch.float32, device=device)
-    viewmat = torch.linalg.inv(T_wc)
+    viewmat = torch.tensor(T_wc, dtype=torch.float32, device=device)
+    viewmat = torch.linalg.inv(viewmat)
     return viewmat.unsqueeze(0)
 
 
@@ -243,7 +180,7 @@ def compute_image_interaction_matrix(grad_Ix, grad_Iy):
     y = (v_coords - CY) / FY
     
     # get a copy of depth with 0s as 100
-    Z = np.full((CAM_H, CAM_W, 1), 4)
+    Z = np.full((CAM_H, CAM_W, 1), 9.6)
     
     # Flatten everything for computation, from H,W to H*W
     x_flat = x.ravel() 
@@ -390,56 +327,79 @@ def save_img(img, title, folder_path) :
 
 
 
-
-def get_gaussians_from_points(xyz, rgb, ply_path, scale=0.01, opacity=1.0, device="cuda", sh_degree=2):
-    H, W, _ = xyz.shape
-    xyz_flat = xyz.reshape(-1, 3)
-    rgb_flat = rgb.reshape(-1, 3)
-    N = xyz_flat.shape[0]
-
-    # -----------------------------
-    # Gaussian parameters
-    # -----------------------------
-    means = torch.from_numpy(xyz_flat).float().to(device)
-    quats = torch.tensor([[1,0,0,0]]*N, dtype=torch.float32, device=device)
-    scales = torch.tensor([[scale, scale, scale]]*N, dtype=torch.float32, device=device)
-    opacities = torch.full((N,), opacity, dtype=torch.float32, device=device)
-
-    num_coeffs = (sh_degree + 1)**2
-    sh = torch.zeros((N, num_coeffs, 3), dtype=torch.float32, device=device)
-    sh[:, 0, :] = torch.from_numpy(rgb_flat).float().to(device)
-
-    # -----------------------------
-    # Save PLY
-    # -----------------------------
-    dtype = [
-        ("x","f4"), ("y","f4"), ("z","f4"),
-        ("rot_0","f4"), ("rot_1","f4"), ("rot_2","f4"), ("rot_3","f4"),
-        ("scale_0","f4"), ("scale_1","f4"), ("scale_2","f4"),
-        ("opacity","f4"),
-        ("f_dc_0","f4"), ("f_dc_1","f4"), ("f_dc_2","f4"),]
+def compute_grayscale_difference(img1, img2, normalize=True):
+    img1_float = img1.astype(np.float32)
+    img2_float = img2.astype(np.float32)
     
-    for i in range(1, num_coeffs):
-        for c in range(3):
-            dtype.append((f"f_rest_{3*(i-1)+c}", "f4"))
+    diff = np.abs(img1_float - img2_float)
+    
+    if normalize:
+        if diff.max() > 0:
+            diff = (diff / diff.max() * 255).astype(np.uint8)
+        else:
+            diff = diff.astype(np.uint8)
+    else:
+        diff = diff.astype(np.uint8)
+    
+    if diff.ndim == 2:
+        diff = diff[:, :, np.newaxis]
+    
+    return diff
 
-    data = np.empty(N, dtype=dtype)
-    data["x"], data["y"], data["z"] = xyz_flat[:,0], xyz_flat[:,1], xyz_flat[:,2]
-    data["rot_0"], data["rot_1"], data["rot_2"], data["rot_3"] = 1,0,0,0
-    data["scale_0"], data["scale_1"], data["scale_2"] = scale, scale, scale
-    data["opacity"] = opacity
-    data["f_dc_0"], data["f_dc_1"], data["f_dc_2"] = rgb_flat[:,0], rgb_flat[:,1], rgb_flat[:,2]
 
-    # higher-order SH = 0
-    for i in range(1, num_coeffs):
-        for c in range(3):
-            data[f"f_rest_{3*(i-1)+c}"] = 0
 
-    PlyData([PlyElement.describe(data, "vertex")]).write(ply_path)
-    print(f"Saved {ply_path} with {N} Gaussians, SH degree={sh_degree}")
 
-    return means, quats, scales, opacities, sh
+def visualize_scene(scene_compos) :
+        o3d.visualization.draw_geometries(
+        scene_compos,
+        window_name="The scene",
+        width=800,
+        height=800,
+        mesh_show_back_face=True)
 
+
+
+def get_sfm_poses(recon) : 
+    axises = []
+    homog_poses = {}
+    for image in recon.images.values():
+        if not image.has_pose:
+            continue
+        T_cw = image.cam_from_world()   # Rigid3d
+        R = T_cw.rotation.matrix()      # (3,3)
+        t = T_cw.translation            # (3,)
+        T_h = LinAlgeb.get_homog_matrix(R,t)
+        homog_poses[image.name] = T_h
+
+        # Making the axises
+        # turn to cam->w for o3d
+        T_vis = np.linalg.inv(T_h)
+        cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+        cam_axis.transform(T_vis)
+        axises.append(cam_axis)
+        
+    return homog_poses, axises
+
+
+
+
+def get_3dpoints(recon) :
+    colors = []
+    xyz_list = []
+
+    for p3d in recon.points3D.values():
+        colors.append(p3d.color)
+        xyz_list.append(p3d.xyz)
+
+    xyz_list = np.array(xyz_list)
+    colors = np.array(colors) # colors are 0-1
+
+    # Create o3d_point_cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz_list)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return xyz_list, colors, pcd
 
 
 
@@ -450,57 +410,64 @@ def get_gaussians_from_points(xyz, rgb, ply_path, scale=0.01, opacity=1.0, devic
 
 def main() :
 
-    # Defining desired cam T 
-    des_T = get_homog([0, 0, 0, 0, 0, 0])
-    des_viewmat = make_viewmat(des_T) #tensor of homog of world frame relatively to camera frame
-
-    # defining initial cam T
-    T_1 = get_homog([0.02, -0.01, -0.02, 0, 0, 0])
-    cur_T = des_T @ T_1
-
-    #getting 3dpoints in world frame and translating them to cur cam nd getting back colors nd points in world
-    points_o3d, points_world, points_cam, colors = load_points("indoor.jpeg", cur_T)
+    # 1 - loading gaussians from the ply :
+    means, quats, scales, opacities, sh = load_gaussians_from_ply(path)
 
 
-    means, quats, scales, opacities, sh = get_gaussians_from_points(
-        xyz=points_world,
-        rgb=colors,
-        ply_path="init_gaussians.ply",
-    )
+    # 2-loading the sfm-cameras and 3d points
+    recon = pycolmap.Reconstruction("/home/user/Bureau/visual_navigation/databases/mini_office_sfm/sparse/0")
+    poses_imgs, axises = get_sfm_poses(recon)
+    xyz, colors, o3dpoints = get_3dpoints(recon)
+    z_mean = xyz[:, 2].mean()
+    print("xyz shape", xyz.shape)
+    print("colors shape", colors.shape)
+    print("Average Z:", z_mean)
+    print("Number of points:", xyz.shape[0])
+
+    compos = [*axises, o3dpoints]
+    visualize_scene(compos)
+
+    return
+
         
-
-
-    # 4 - rendering desired image
-    t1 = datetime.now()    
+    # 3- rendering from cam-1 as desired pose using gsplat (we get des_T in wf)
+    _, des_T = list(poses_imgs.items())[2]
+    # keeping dest_T in cf
+    des_T = np.linalg.inv(des_T)
+    # turn it to wf then to torch
+    des_viewmat = make_viewmat(des_T)
     des_img = render_view(means, quats, scales, opacities, sh, des_viewmat, Ks, CAM_W, CAM_H)
-    t2 = datetime.now()
-    diff_ms = (t2 - t1).total_seconds() * 1000
-    print("rendering time in ms : ", diff_ms)
-
-    save_img(des_img, "desired img", "gs_frames")
-    plot_img(des_img, "des_img")
+    
+    # getting S_star
     gray_des = 0.299 * des_img[:, :, 0] + 0.587 * des_img[:, :, 1] + 0.114 * des_img[:, :, 2]
-    S_star = gray_des.flatten()
-
-    #making our matp visualizer
-    #matp_vis = LiveOptimizationVisualizer(des_img)
+    S_star = gray_des.flatten()    
+    save_img(des_img, f"desired_img", "frames/")
+    
+    # getting init pose
+    # here it is in fw
+    _, cur_T = list(poses_imgs.items())[3]
+    # keeping cur_T in cf
+    cur_T = np.linalg.inv(des_T)
+    cur_T = des_T @ get_homog([0, 0.3, 0, 0, 0, 0])
 
 
     try:
-        for i in range(500):
+        for i in range(999):
 
-            # 1 - taking pic from cur_T
+            # 1 - taking pic from cur_T (this function turn it to cf then torch for gsplat to use)
             cur_viewmat = make_viewmat(cur_T) 
             cur_img = render_view(means, quats, scales, opacities, sh, cur_viewmat, Ks, CAM_W, CAM_H)
             gray_cur = 0.299 * cur_img[:, :, 0] + 0.587 * cur_img[:, :, 1] + 0.114 * cur_img[:, :, 2]
             S = gray_cur.flatten()
             if(i==0):
-                plot_img(cur_img, "initial img")
+                #making our matp visualizer
+                matp_vis = LiveOptimizationVisualizer(des_img, cur_img)
 
             # 2 - Compute the cost with des_img
             diff = S - S_star
             cost = diff.T @ diff
             print(f"Cost {i} :", cost)
+            current_diff_img = compute_grayscale_difference(gray_cur, gray_des)
 
             # 3 - Compute Gradient and Ls 
             grad_Ix, grad_Iy = get_grads_visp(gray_cur)
@@ -509,18 +476,19 @@ def main() :
             # 4- scaling the v based on our pose
             if cost > 20000 :  
                 max_val = 0.1 
-                mu = 999999999 
+                mu = 60000 
             elif cost > 5000 :  
-                max_val = 0.1 
-                mu=0.0000001   
+                max_val = 0.01 
+                mu=60000   
             elif cost > 500 :  
-                max_val = 0.05  
+                max_val = 0.01  
                 mu=0.0000001 
             elif cost > 50 :  
-                max_val = 0.01  
+                max_val = 0.001  
                 mu=0.0000001 
             elif cost > 15 : 
-                max_val = 0.01  
+                max_val = 0.001 
+                mu=0.0000001
             else : 
                 break 
                     
@@ -533,16 +501,15 @@ def main() :
             
             # 6 - Update camera pose & update matplotlib vis data
             cur_T = update_cam_pose(cur_T, V, dt)
+            save_img(cur_img, i, "frames/")
+            matp_vis.update(i, cur_img, cur_img, current_diff_img, V, cost)
 
-            save_img(cur_img, i, "gs_frames")
-            #matp_vis.update(i, des_img, cur_img, V, cost)
-
-        #matp_vis.close()
+        matp_vis.close()
 
 
     except KeyboardInterrupt:
         print("\nCtrl+C detected, exiting loop cleanly.")
-        #matp_vis.close()
+        matp_vis.close()
 
 
 

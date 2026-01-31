@@ -17,6 +17,11 @@ from PIL import Image
 
 
 
+
+
+
+
+
 #_____ parameters
 
 CAM_W, CAM_H = 700, 600
@@ -110,78 +115,6 @@ def load_points(img_path, cam_homog) :
     points_o3d.points = o3d.utility.Vector3dVector(pts[valid])
     points_o3d.colors = o3d.utility.Vector3dVector(clrs[valid])
     return points_o3d, points_world, points_cam, colors
-
-
-
-
-
-def load_gaussians_from_ply(ply_path, device="cuda"):
-    ply = PlyData.read(ply_path)
-    v = ply["vertex"].data
-
-    N = v.shape[0]
-    print(N)
-
-
-    # Positions
-    means = torch.stack([
-        torch.from_numpy(v["x"]),
-        torch.from_numpy(v["y"]),
-        torch.from_numpy(v["z"]),
-    ], dim=1).float()
-
-
-    # Rotations
-    quats = torch.stack([
-        torch.from_numpy(v["rot_0"]),
-        torch.from_numpy(v["rot_1"]),
-        torch.from_numpy(v["rot_2"]),
-        torch.from_numpy(v["rot_3"]),
-    ], dim=1).float()
-
-    quats = quats / quats.norm(dim=1, keepdim=True)
-
-
-    # Scales
-    scales_log = torch.stack([
-        torch.from_numpy(v["scale_0"]),
-        torch.from_numpy(v["scale_1"]),
-        torch.from_numpy(v["scale_2"]),
-    ], dim=1).float()
-
-    scales = torch.exp(scales_log)
-    scales = scales.clamp(1e-4, 0.05)
-
-
-    # Opacity
-    opacities = torch.sigmoid(
-        torch.from_numpy(v["opacity"]).float()
-    )
-
-
-    # SH coefficients
-    f_rest_cols = [k for k in v.dtype.names if k.startswith("f_rest_")]
-    num_rest = len(f_rest_cols) // 3
-    num_coeffs = 1 + num_rest
-
-    sh = torch.zeros((N, num_coeffs, 3), dtype=torch.float32)
-
-    sh[:, 0, 0] = torch.from_numpy(v["f_dc_0"])
-    sh[:, 0, 1] = torch.from_numpy(v["f_dc_1"])
-    sh[:, 0, 2] = torch.from_numpy(v["f_dc_2"])
-
-    for i in range(num_rest):
-        sh[:, i + 1, 0] = torch.from_numpy(v[f"f_rest_{3*i+0}"])
-        sh[:, i + 1, 1] = torch.from_numpy(v[f"f_rest_{3*i+1}"])
-        sh[:, i + 1, 2] = torch.from_numpy(v[f"f_rest_{3*i+2}"])
-
-    return (
-        means.to(device),
-        quats.to(device),
-        scales.to(device),
-        opacities.to(device),
-        sh.to(device),
-    )
 
 
 
@@ -390,101 +323,272 @@ def save_img(img, title, folder_path) :
 
 
 
-def get_gaussians_from_points(
-    xyz,
-    rgb,
-    ply_path,
-    scale=0.01,
-    opacity=1,
-    device="cuda",
-    sh_degree=2,
-):
 
+def make_ply_from_points(xyz, rgb, ply_path, scale=0.01, alpha=0.95, sh_degree=2, device="cuda"):
+    
+    # Flatten inputs
     xyz_flat = xyz.reshape(-1, 3)
     rgb_flat = rgb.reshape(-1, 3)
     N = xyz_flat.shape[0]
 
-    # Getting gaussian properties for gsplat rasterization
+    # Normalize RGB if needed
+    if rgb_flat.max() > 1.0:
+        rgb_flat = rgb_flat / 255.0
+    rgb_flat = np.clip(rgb_flat, 0.0, 1.0)
 
-    means = torch.from_numpy(xyz_flat).float().to(device)
+    # Opacity logit
+    eps = 1e-6
+    alpha_clamped = np.clip(alpha, eps, 1.0 - eps)
+    opacity_logit = np.log(alpha_clamped / (1 - alpha_clamped))
 
-    quats = torch.zeros((N, 4), dtype=torch.float32, device=device)
-    quats[:, 0] = 1.0  # identity quaternion (w,x,y,z)
+    # Scale in log-space
+    scale_log = np.log(scale)
 
-    scales = torch.full((N, 3), scale, dtype=torch.float32, device=device)
-
-    opacities = torch.full((N,), opacity, dtype=torch.float32, device=device)
-
+    # SH coefficients
     num_coeffs = (sh_degree + 1) ** 2
-    sh = torch.zeros((N, num_coeffs, 3), dtype=torch.float32, device=device)
-    sh[:, 0, :] = torch.from_numpy(rgb_flat).float().to(device)
+    f_dc = rgb_flat.copy()                      # 0th-order SH
+    f_rest = np.zeros((N, num_coeffs - 1, 3))  # remaining SH coefficients all zeros
+    sh_all = np.concatenate([f_dc[:, np.newaxis, :], f_rest], axis=1)  # shape (N, num_coeffs, 3)
 
-    
-
-    # Storing PLy______________________
-
-    # scale must be stored in log-space
-    scale = np.log(scale)
-
+    # Define PLY dtype
     dtype = [
         ("x", "f4"), ("y", "f4"), ("z", "f4"),
-
-        ("rot_0", "f4"), ("rot_1", "f4"),
-        ("rot_2", "f4"), ("rot_3", "f4"),
-
-        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
-
-        ("opacity", "f4"),
-
+        ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
         ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+        ("opacity", "f4"),
+        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
     ]
-
     for i in range(1, num_coeffs):
         for c in range(3):
             dtype.append((f"f_rest_{3*(i-1)+c}", "f4"))
 
+    # Fill PLY data
+    data = np.empty(N, dtype=dtype)
+    data["x"], data["y"], data["z"] = xyz_flat.T
+    data["nx"] = data["ny"] = data["nz"] = 0.0
+    data["rot_0"] = 1.0
+    data["rot_1"] = data["rot_2"] = data["rot_3"] = 0.0
+    data["scale_0"] = data["scale_1"] = data["scale_2"] = scale_log
+    data["opacity"] = -1.8042
+    data["f_dc_0"] = f_dc[:, 0]
+    data["f_dc_1"] = f_dc[:, 1]
+    data["f_dc_2"] = f_dc[:, 2]
+
+    for i in range(1, num_coeffs):
+        for c in range(3):
+            data[f"f_rest_{3*(i-1)+c}"] = f_rest[:, i-1, c]
+
+    # Write PLY
+    PlyData([PlyElement.describe(data, "vertex")]).write(ply_path)
+    print(f"Saved reference PLY: {ply_path} | {N} Gaussians | scale={scale} | alpha={alpha} | SH degree={sh_degree}")
+
+
+
+
+
+
+    # -----------------------------
+    # Debug prints for first few points
+    # -----------------------------
+    num_print = min(5, N)
+    for idx in range(num_print):
+        print(f"\n=== Gaussian {idx} ===")
+        print("XYZ:", xyz_flat[idx])
+        print("RGB normalized:", rgb_flat[idx])
+        print("Opacity logit:", opacity_logit)
+        print("Scale log:", scale_log)
+        print("Rotation quaternion:", [1.0, 0.0, 0.0, 0.0])
+        print("SH f_dc:", f_dc[idx])
+        print("SH f_rest (all):", f_rest[idx])
+        print("All SH concatenated:", sh_all[idx])
+
+    # Return runtime tensors for further processing if needed
+    means = torch.from_numpy(xyz_flat).float().to(device)
+    scales = torch.full((N, 3), scale, dtype=torch.float32, device=device)
+    quats = torch.zeros((N, 4), dtype=torch.float32, device=device)
+    quats[:, 0] = 1.0
+    opacities = torch.full((N,), alpha, dtype=torch.float32, device=device)
+    sh = torch.from_numpy(sh_all).float().to(device)
+
+    return means, quats, scales, opacities, sh
+
+
+
+
+
+
+
+def init_gaussians_from_points(
+    xyz,
+    rgb,
+    ply_path,
+    scale=0.01,
+    alpha=0.1,
+    sh_degree=2,
+    device="cuda",
+):
+    """
+    Initialize 3D Gaussians from colored point clouds.
+
+    This function:
+    1) Converts RGB → SH (0th order) using GS convention
+    2) Writes a GS-compatible PLY file
+    3) Creates runtime tensors compatible with gsplat / Inria code
+
+    IMPORTANT:
+    - Behavior must match Inria initialization exactly
+    - No rendering logic is here, only parameter initialization
+    """
+
+    # ==========================================================
+    # Spherical Harmonics constant (from Gaussian Splatting paper)
+    # ==========================================================
+    # SH basis Y_0^0 = C0
+    # Renderer reconstructs:
+    #   RGB = C0 * f_dc + 0.5
+    C0 = 0.28209479177387814
+
+    # ==========================================================
+    # Input preparation
+    # ==========================================================
+    # Flatten input arrays
+    xyz = xyz.reshape(-1, 3)
+    rgb = rgb.reshape(-1, 3)
+    N = xyz.shape[0]
+
+    # Ensure RGB is normalized to [0, 1]
+    if rgb.max() > 1.0:
+        rgb = rgb / 255.0
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    # ==========================================================
+    # RGB → SH (0th order coefficient only)
+    # ==========================================================
+    # In Gaussian Splatting, colors are stored in SH space.
+    # The DC (0th order) coefficient encodes view-independent color.
+    #
+    # Inria / gsplat convention:
+    #   f_dc = (RGB - 0.5) / C0
+    #
+    # Renderer later reconstructs:
+    #   RGB = C0 * f_dc + 0.5
+    #
+    # This ensures zero-centered SH coefficients and stable optimization.
+    f_dc = (rgb - 0.5) / C0
+
+    # Number of SH coefficients:
+    # degree=2 → (2+1)^2 = 9
+    num_sh = (sh_degree + 1) ** 2
+
+    # ==========================================================
+    # Opacity initialization
+    # ==========================================================
+    # Gaussian Splatting optimizes opacity in logit space.
+    #
+    # Forward rendering uses:
+    #   alpha = sigmoid(opacity_logit)
+    #
+    # So we store the inverse-sigmoid here.
+    eps = 1e-6
+    alpha = np.clip(alpha, eps, 1 - eps)
+    opacity_logit = np.log(alpha / (1 - alpha))
+
+    # ==========================================================
+    # Scale initialization
+    # ==========================================================
+    # GS stores Gaussian scale in log-space:
+    #   scale = exp(scale_log)
+    #
+    # We initialize isotropic Gaussians (same scale in x,y,z)
+    scale_log = np.log(scale)
+
+    # ==========================================================
+    # PLY file structure (GS-compatible)
+    # ==========================================================
+    # This layout exactly matches what gsplat / Inria loaders expect.
+    dtype = [
+        ("x", "f4"), ("y", "f4"), ("z", "f4"),          # Gaussian center
+        ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),       # Unused normals
+        ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),  # SH DC
+        ("opacity", "f4"),                              # Opacity logit
+        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),  # log-scales
+        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),  # quaternion
+    ]
+
+    # Higher-order SH coefficients (initialized to zero)
+    for i in range(num_sh - 1):
+        for c in range(3):
+            dtype.append((f"f_rest_{3*i + c}", "f4"))
+
     data = np.empty(N, dtype=dtype)
 
-    # positions
-    data["x"] = xyz_flat[:, 0]
-    data["y"] = xyz_flat[:, 1]
-    data["z"] = xyz_flat[:, 2]
+    # ==========================================================
+    # Fill PLY data
+    # ==========================================================
+    # Positions
+    data["x"], data["y"], data["z"] = xyz.T
 
-    # rotation
+    # Normals are unused by GS → set to zero
+    data["nx"] = data["ny"] = data["nz"] = 0.0
+
+    # SH DC coefficients
+    data["f_dc_0"] = f_dc[:, 0]
+    data["f_dc_1"] = f_dc[:, 1]
+    data["f_dc_2"] = f_dc[:, 2]
+
+    # Opacity logit
+    data["opacity"] = opacity_logit
+
+    # Isotropic scale (log-space)
+    data["scale_0"] = scale_log
+    data["scale_1"] = scale_log
+    data["scale_2"] = scale_log
+
+    # Identity rotation quaternion
+    # (w, x, y, z) = (1, 0, 0, 0)
     data["rot_0"] = 1.0
     data["rot_1"] = 0.0
     data["rot_2"] = 0.0
     data["rot_3"] = 0.0
 
-    # scale (log)
-    data["scale_0"] = scale
-    data["scale_1"] = scale
-    data["scale_2"] = scale
-
-    # opacity 
-    data["opacity"] = opacity
-
-    # SH colors
-    data["f_dc_0"] = rgb_flat[:, 0]
-    data["f_dc_1"] = rgb_flat[:, 1]
-    data["f_dc_2"] = rgb_flat[:, 2]
-
-    # higher SH = 0
-    for i in range(1, num_coeffs):
+    # Higher-order SH coefficients start at zero
+    for i in range(num_sh - 1):
         for c in range(3):
-            data[f"f_rest_{3*(i-1)+c}"] = 0.0
+            data[f"f_rest_{3*i + c}"] = 0.0
 
+    # Write PLY to disk
     PlyData([PlyElement.describe(data, "vertex")]).write(ply_path)
 
-    print(
-        f"Saved {ply_path} | "
-        f"{N} Gaussians | "
-        f"scale={scale} | "
-        f"opacity={opacity:.3f} | "
-        f"SH degree={sh_degree}"
-    )
+    # ==========================================================
+    # Runtime tensors for gsplat
+    # ==========================================================
+    # These tensors are used directly by the renderer / optimizer.
+    means = torch.from_numpy(xyz).float().to(device)
+    scales = torch.full((N, 3), scale, device=device)
+    quats = torch.zeros((N, 4), device=device)
+    quats[:, 0] = 1.0  # identity rotation
+    opacities = torch.full((N,), alpha, device=device)
+
+    # SH tensor layout: [N, num_sh, 3]
+    sh = torch.zeros((N, num_sh, 3), device=device)
+    sh[:, 0, :] = torch.from_numpy(f_dc).to(device)
+
+    # ==========================================================
+    # Debug print (single Gaussian)
+    # ==========================================================
+    print("=============== GS INIT DEBUG ===============")
+    print("XYZ:", xyz[0])
+    print("RGB:", rgb[0])
+    print("f_dc (SH space):", f_dc[0])
+    print("Reconstructed RGB:", C0 * f_dc[0] + 0.5)
+    print("Opacity:", alpha, "| logit:", opacity_logit)
+    print("Scale:", scale, "| log:", scale_log)
+    print("============================================")
+    print(f"Saved PLY: {ply_path} | {N} Gaussians | SH degree={sh_degree}")
 
     return means, quats, scales, opacities, sh
+
 
 
 
@@ -525,7 +629,7 @@ def compute_grayscale_difference(img1, img2, normalize=True):
 
 
 def main() :
-
+    
     # Defining desired cam T 
     des_T = get_homog([0, 0, 0, 0, 0, 0])
     des_viewmat = make_viewmat(des_T) #tensor of homog of world frame relatively to camera frame
@@ -539,12 +643,13 @@ def main() :
     points_o3d, points_world, points_cam, colors = load_points(img_path, cur_T)
 
 
-    means, quats, scales, opacities, sh = get_gaussians_from_points(
+    means, quats, scales, opacities, sh = init_gaussians_from_points(
         xyz=points_world,
         rgb=colors,
         ply_path="scenes/init_gaussians.ply",
     )
-        
+
+
 
     # 4 - rendering desired image
     t1 = datetime.now()    
@@ -629,3 +734,5 @@ def main() :
 
 if __name__ == "__main__":
     main()
+
+ 

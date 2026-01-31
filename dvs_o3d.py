@@ -32,7 +32,6 @@ mesh_path = "scenes/room_points_holes.ply"
 img_path = "imgs/room.jpeg"
 
 
-
 CAM_W2, CAM_H2 = 400, 300
 FX2 = FY2 = 0.8 * max(CAM_W2, CAM_H2)
 CX2, CY2 = CAM_W2 / 2.0, CAM_H2 / 2.0
@@ -46,6 +45,8 @@ intrins2 = o3d.camera.PinholeCameraIntrinsic(
 )
 
 np.set_printoptions(precision=2, suppress=False)
+
+
 
 
 
@@ -75,6 +76,8 @@ def load_mesh(path, lambert) :
     mesh.scale(3 , center=mesh.get_center()) 
 
     return mesh 
+
+
 
 
 
@@ -141,8 +144,9 @@ def load_points(img_path, cam_homog) :
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts[valid])
     pcd.colors = o3d.utility.Vector3dVector(colors[valid])
-    #o3d.io.write_point_cloud("scenes/room_points.ply", pcd)
+    o3d.io.write_point_cloud("scenes/room_points.ply", pcd)
     return pcd
+
 
 
 
@@ -167,7 +171,6 @@ def set_cameras(cur_pose_vect) :
     cur_camera_axis.transform(cur_T_cw)
 
     return cur_T_cw, des_T_cw, des_camera_axis, cur_camera_axis
-
 
 
 
@@ -500,46 +503,30 @@ def compute_grayscale_difference(img1, img2, normalize=True):
 def main() :
 
     
-    pcd = o3d.io.read_point_cloud(mesh_path)
-    pcd.normals = o3d.utility.Vector3dVector([])
-    mesh = pcd
-        
-    
+    # Load mesh nd setup 
+    mesh = load_mesh(mesh_path, lambert=False)
+
+
     # setup init nd desired homog matrices nd axises
-    #cur_pose_vect = [2, 0, -2, 0, 0, 0]  
-    #cur_extrins, des_extrins, des_cam_axis, cur_cam_axis = set_cameras(cur_pose_vect)
+    cur_pose_vect = [2, 0, -2, 0, 0, 0]  
+    cur_extrins, des_extrins, des_cam_axis, cur_cam_axis = set_cameras(cur_pose_vect)
 
-
-    # Defining desired cam T 
-    des_extrins = get_homog([0, 0, 0, 0, 0, 0])
-
-    # defining initial cam T
-    T_1 = get_homog([0.3, -0.2, 0, 0, 0, 0]) #near
-    #T_1 = get_homog([2.2, 0, -2, 0, 0, 0]) #far
-    cur_extrins = des_extrins @ T_1
-
-    # get init 3d points from img with moge nd translate them to cur_cam frame
-    #points = load_points(img_path, cur_extrins)
-    #mesh = points
-
-    
-    # taking pic from des_cam
+    # Taking pic from des_cam
     des_img, des_depth = takin_pic(mesh, des_extrins)
     plot_img(des_img, "desired_image")
     plot_img(des_depth, "desired_depthMap")
     save_img(des_img, "des", "frames")
+    
     gray_des = 0.299 * des_img[:, :, 0] + 0.587 * des_img[:, :, 1] + 0.114 * des_img[:, :, 2]
     S_star = gray_des.flatten()
 
 
-    # intialize trajectory scene : the visualizer with frames, mesh and line
+    # Intialize trajectory scene : the visualizer with frames, mesh and line
     camera_centers = []
     trajectory_line = o3d.geometry.LineSet()
     o3d_vis = o3d.visualization.Visualizer()
-    #initialize_traject_visualizer(o3d_vis, trajectory_line, des_cam_axis, cur_cam_axis, des_extrins, mesh)
+    initialize_traject_visualizer(o3d_vis, trajectory_line, des_cam_axis, cur_cam_axis, des_extrins, mesh)
     prev_cur_frame = None
-
-
 
 
     #____________________________________________________________________________________
@@ -549,7 +536,7 @@ def main() :
         for i in range(999):
 
             # 0 - Update visualizer of trajects
-            #prev_cur_frame, scene_img = update_traject_visualizer(i, o3d_vis, trajectory_line, camera_centers, cur_extrins, prev_cur_frame)
+            prev_cur_frame, scene_img = update_traject_visualizer(i, o3d_vis, trajectory_line, camera_centers, cur_extrins, prev_cur_frame)
 
             # 1 - Capture current img nd get S
             cur_img, cur_depth_map = takin_pic(mesh, cur_extrins)
@@ -571,7 +558,6 @@ def main() :
             # 3 - Compute Gradient and Ls 
             grad_Ix, grad_Iy = get_grads_visp(gray_cur)
             Ls = compute_image_interaction_matrix(cur_depth_map, grad_Ix, grad_Iy)
-
 
             # 4- scaling the v based on our pose
             if cost > 10000 :  
@@ -600,7 +586,7 @@ def main() :
             
             # 6 - Update camera pose & update matplotlib vis data
             cur_extrins = update_cam_pose(cur_extrins, V, dt)
-            #matp_vis.update(i, scene_img, cur_img, current_diff_img, V,  cost)
+            matp_vis.update(i, scene_img, cur_img, current_diff_img, V,  cost)
 
         matp_vis.close()
         o3d_vis.close()
@@ -610,6 +596,8 @@ def main() :
         matp_vis.close()
         o3d_vis.close()
         os._exit(0)
+
+       
 
 
 
