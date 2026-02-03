@@ -33,7 +33,7 @@ Ks = torch.tensor(
 ).unsqueeze(0)
 
 
-dt = 0.4
+dt = 0.1
 lamda = 0.1
 path = "scenes/mini_office_gs.ply"
 
@@ -427,13 +427,17 @@ def main() :
     compos = [*axises, o3dpoints]
     visualize_scene(compos)
 
-    return
+
+
+    # getting init pose
+    # here it is in fw
+    _, cur_T = list(poses_imgs.items())[2]
+    # keeping cur_T in cf
+    cur_T = np.linalg.inv(cur_T)
 
         
     # 3- rendering from cam-1 as desired pose using gsplat (we get des_T in wf)
-    _, des_T = list(poses_imgs.items())[2]
-    # keeping dest_T in cf
-    des_T = np.linalg.inv(des_T)
+    des_T = cur_T @ get_homog([-3, -1.2, 0, -np.pi/10, np.pi/10, 0])
     # turn it to wf then to torch
     des_viewmat = make_viewmat(des_T)
     des_img = render_view(means, quats, scales, opacities, sh, des_viewmat, Ks, CAM_W, CAM_H)
@@ -443,12 +447,7 @@ def main() :
     S_star = gray_des.flatten()    
     save_img(des_img, f"desired_img", "frames/")
     
-    # getting init pose
-    # here it is in fw
-    _, cur_T = list(poses_imgs.items())[3]
-    # keeping cur_T in cf
-    cur_T = np.linalg.inv(des_T)
-    cur_T = des_T @ get_homog([0, 0.3, 0, 0, 0, 0])
+
 
 
     try:
@@ -475,10 +474,10 @@ def main() :
 
             # 4- scaling the v based on our pose
             if cost > 20000 :  
-                max_val = 0.1 
+                max_val = 0.5 
                 mu = 60000 
             elif cost > 5000 :  
-                max_val = 0.01 
+                max_val = 0.1 
                 mu=60000   
             elif cost > 500 :  
                 max_val = 0.01  
@@ -499,7 +498,7 @@ def main() :
             V = scale_by_max(V, max_val)
 
             
-            # 6 - Update camera pose & update matplotlib vis data
+            # 6 - Update camera pose (which considere cur_T in cf) & update matplotlib vis data
             cur_T = update_cam_pose(cur_T, V, dt)
             save_img(cur_img, i, "frames/")
             matp_vis.update(i, cur_img, cur_img, current_diff_img, V, cost)

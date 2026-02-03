@@ -303,13 +303,6 @@ def main() :
 
 
 
-    # i wanna loop on this homog_poses list     
-    # make an axis for each one, cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1)
-    # and transofrm it with homog matrix: cam_axis.transform(homog)
-    # and add it to a list of o3daxises
-
-
-
    
 
 

@@ -298,8 +298,6 @@ def get_feats_depth(features, depth_map) :
         
         features_depth.append(depth_map[f[1],f[0]])
 
-
-
     return np.array(features_depth)
 
 
