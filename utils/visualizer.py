@@ -95,7 +95,7 @@ class LiveOptimizationVisualizer:
         self.loss_line, = self.ax_loss.plot([], [], 'b-')
 
         # ===== Scene =====
-        self.ax_scene.set_title('Current Frame')
+        self.ax_scene.set_title('SIFT matches')
         self.ax_scene.axis('off')
         self.scene_img_plot = None
 

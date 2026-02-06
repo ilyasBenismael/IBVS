@@ -223,7 +223,7 @@ def get_init_axes_and_imgs(
         )
 
         # visualize camera in world → invert if T is world->camera
-        cam_axis.transform(np.linalg.inv(T))
+        cam_axis.transform(T)
 
         compos.append(cam_axis)
 

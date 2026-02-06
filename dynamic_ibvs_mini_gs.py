@@ -16,15 +16,29 @@ import open3d as o3d
 
 
 
+#_________IBVS Vars :
+lambda_gain = 0.01
+dt = 0.1
+nbr_features = 10
 
 
 
-# Cam vars
 
+#________our robot camera
 CAM_W, CAM_H = 1500, 1000
 FX = FY = 0.8 * max(CAM_W, CAM_H)
 f=1
 CX, CY = CAM_W / 2.0, CAM_H / 2.0
+#intrinsic format for o3d camera
+intrins = o3d.camera.PinholeCameraIntrinsic(
+    width=CAM_W,
+    height=CAM_H,
+    fx=FX,
+    fy=FY,
+    cx=CX,
+    cy=CY
+)
+#intrinsic format for gsplat rendering
 Ks = torch.tensor(
     [[FX, 0.0, CX],
         [0.0, FY, CY],
@@ -34,10 +48,11 @@ Ks = torch.tensor(
 ).unsqueeze(0)
 
 
-
+#_____trajectory visualier camera 
 CAM_W2, CAM_H2 = 400, 300
 FX2 = FY2 = 0.8 * max(CAM_W2, CAM_H2)
 CX2, CY2 = CAM_W2 / 2.0, CAM_H2 / 2.0
+#o3d format
 intrins2 = o3d.camera.PinholeCameraIntrinsic(
     width=CAM_W2,
     height=CAM_H2,
@@ -49,20 +64,16 @@ intrins2 = o3d.camera.PinholeCameraIntrinsic(
 
 
 
-# IBVS Vars :
-lambda_gain = 0.1
-dt = 0.1
-nbr_features = 10
-
-
-#Paths : 
-path = "scenes/office_250.ply"
-
+#___________Paths : 
+gs_path = "gs_scenes/office2_10_250.ply"
+mesh_path = "meshes/office2.glb"
+sfm_recons_path = "sfm_scenes/office2_10imgs/sparse/0"
+sfm_images_path = "sfm_scenes/office2_10imgs/images"
+gs_frames_path = "frames/minigs"
 
 
 
-
-
+#__________________________________________________________________________________________________
 
 
 
@@ -71,6 +82,47 @@ path = "scenes/office_250.ply"
 def get_homog(pose_vector) :
     R,t = LinAlgeb.make_rot_trans(*pose_vector)
     return LinAlgeb.get_homog_matrix(R,t)
+
+
+
+
+
+def load_mesh(path, lambert) :
+    
+    # loading the mesh, enable post to render the colored texture, (no normals for lambertian)
+    mesh = o3d.io.read_triangle_mesh(path, enable_post_processing=True)
+    print(f"Number of vertices: {len(mesh.vertices)}")
+
+    
+    if(not lambert) :
+        mesh.compute_vertex_normals()  
+
+    # center the mesh, and scaling it
+    mesh.translate(-mesh.get_center()) 
+    mesh.scale(3 , center=mesh.get_center()) 
+
+    return mesh 
+
+
+
+
+def set_init_cam(mesh, save = False) :
+
+    # making athe world axis // default args keep position 000 matching wf nd also the size as 1 same as wf units
+    init_cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1)
+
+    # Making the des_pose centered in front of the scene by transforming wf with 2 succssf trnsfs
+    T_cw1 = get_homog([0, 0, 0, 0, 0, -np.pi])  
+    T_cw2 = get_homog([0, 0, 0, 0, np.pi/2, 0])  
+    T_cw3 = get_homog([0, 0, -10, 0, 0, 0])
+    init_extrins = T_cw1 @ T_cw2 @ T_cw3
+    init_cam_axis.transform(init_extrins)
+    image, _ = takin_pic(mesh, init_extrins)
+
+    if(save) :
+        save_img(image, 1, sfm_images_path)
+    
+    return init_extrins, init_cam_axis, image
 
 
 
@@ -256,6 +308,43 @@ def update_cam_pose(cam_homog, Vc, dt):
 
 
 
+def takin_pic(mesh, extrins):
+
+    # defining extrins and T_cw_final params 
+    extrins = np.linalg.inv(extrins)
+
+    # making our pincamparams objct
+    cam_params = o3d.camera.PinholeCameraParameters()
+    cam_params.intrinsic = intrins
+    cam_params.extrinsic = extrins
+
+    # ---------- Create visualizer ----------
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(width=CAM_W, height=CAM_H, visible=False)
+    vis.add_geometry(mesh)
+
+
+    # ---------- Apply camera ----------
+    ctr = vis.get_view_control()
+    ctr.convert_from_pinhole_camera_parameters(
+        cam_params,
+        allow_arbitrary=True
+    )
+
+    # ---------- Render once ----------
+    vis.poll_events()
+    vis.update_renderer()
+
+    # ---------- Capture image ----------
+    img = vis.capture_screen_float_buffer()
+    depth = vis.capture_depth_float_buffer()
+    vis.destroy_window()
+
+    return np.asarray(img), np.asarray(depth) 
+
+
+
+
 def save_img(img, title, folder_path) :
     img = np.asarray(img)
     img_u8 = (img * 255).astype(np.uint8)
@@ -312,7 +401,7 @@ def get_sfm_poses(recon) :
         # Making the axises
         # turn to cam->w for o3d
         T_vis = np.linalg.inv(T_h)
-        cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+        cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
         cam_axis.transform(T_vis)
         axises.append(cam_axis)
         
@@ -342,7 +431,6 @@ def get_3dpoints(recon) :
 
 
 
-
 def get_features(img):
 
     # Convert normalized RGB to uint8 format
@@ -358,8 +446,6 @@ def get_features(img):
     kp, des = sift.detectAndCompute(gray, None)
 
     return kp, des
-
-
 
 
 
@@ -403,7 +489,7 @@ def get_matches(nbr_features, kp1, des1, kp2, des2, cur_img, des_img, show, i) :
 
     img = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
     img = np.asarray(img)
-    cv2.imwrite(f"frames/fibvs_4matches/{i}.png", img)
+    cv2.imwrite(f"{gs_frames_path}/{i}.png", img)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
 
@@ -493,12 +579,7 @@ def get_inter_mat_pseudo_inverse(intr_mat):
 
 
 
-
-
-
-
-
-def initialize_traject_visualizer(vis, trajectory_line, des_cam_axis, cur_cam_axis, des_extrins, mesh) :
+def initialize_traject_visualizer(vis, trajectory_line, des_cam_axis, cur_cam_axis, init_extrins, mesh) :
 
     # init visualizer 
     vis.create_window(
@@ -512,10 +593,10 @@ def initialize_traject_visualizer(vis, trajectory_line, des_cam_axis, cur_cam_ax
 
 
     # Define the POV pose (static observer camera)
-    T_cw = get_homog([3, -1, -3, 0, 0, 0])
+    T_cw = get_homog([0, 0, -3, 0, 0, 0])
     T_cw1 = get_homog([0, 0, 0, 0, 0, 0])
     T_cw2 = get_homog([0, 0, 0, 0, 0, 0])
-    pov_extrins = des_extrins @ T_cw @ T_cw1 @ T_cw2
+    pov_extrins = init_extrins @ T_cw @ T_cw1 @ T_cw2
     pov_extrins = np.linalg.inv(pov_extrins)
 
     # Create Open3D camera parameters
@@ -532,7 +613,6 @@ def initialize_traject_visualizer(vis, trajectory_line, des_cam_axis, cur_cam_ax
 
     # set up things somehow hh
     vis.poll_events()
-    #vis.update_renderer()
 
 
 
@@ -580,7 +660,51 @@ def update_traject_visualizer(i, vis,trajectory_line, camera_centers, cur_extrin
 
 
 
+
+def set_init_cams(
+    mesh,
+    init_o3d_cam_pose,
+    motions,
+    axis_size=1.5,
+    save = False
+):
+
+    o3d_cam_poses = []
+    o3d_cam_axises = []
+    images = []
+
+    for i, m in enumerate(motions, start=2):
+
+        # build transform
+        T = (
+            init_o3d_cam_pose
+            @ get_homog([*m["t"], 0, 0, 0])
+            @ get_homog([0, 0, 0, *m["r"]])
+        )
+
+        img, _ = takin_pic(mesh, T)
+        if(save) :
+            save_img(img, i, "frames/sfm/images")
+        images.append(img)
+        o3d_cam_poses.append(T)
+
+
+        # create axis
+        cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_size
+        )
+
+        cam_axis.transform(T)
+
+        o3d_cam_axises.append(cam_axis)
+
+
+    return o3d_cam_poses, o3d_cam_axises, images
+
     
+
+
+
 
 
 #__________________________________________________________________________________
@@ -588,70 +712,135 @@ def update_traject_visualizer(i, vis,trajectory_line, camera_centers, cur_extrin
 
 def main() :
 
-    # 1 - loading gaussians from the ply :
-    means, quats, scales, opacities, sh = load_gaussians_from_ply(path)
+
+    #_________IBVS Vars :
+    lambda_gain = 0.01
+    dt = 0.1
     nbr_features = 10
 
 
-    # 2-loading the sfm-cameras and 3d points
-    recon = pycolmap.Reconstruction("/home/user/Bureau/visual_navigation/databases/mini_office_sfm/sparse/0")
-    poses_imgs, axises = get_sfm_poses(recon)
-    xyz, colors, o3dpoints = get_3dpoints(recon)
+    # I)__________________ setting up real world (o3d) :
+
+    # o3d images, the images that we will be using for the whole pipeline, numpy hw3 each
+    all_o3d_images = []
+
+    # load the o3d mesh  
+    scene_mesh = load_mesh(mesh_path, lambert=False)
+
+    # Defining our initial camera we set it manually inside the function
+    init_o3d_cam_pose, init_o3d_cam_axis, init_o3d_img = set_init_cam(scene_mesh, save = False)
+    all_o3d_images.append(init_o3d_img)
+
+    
+    # Manually choosing the number of initial cams poses (relatively to intial o3d camera) :
+    # choosing 10 init randome vectors (relative to init)
+    # these are the same o3d poses I used for sfm
+    motions = [
+    {"t": [2, -1, 1],  "r": [0, -np.pi/10, 0]},
+    {"t": [4, 0, 0],   "r": [0, -np.pi/10, 0]},
+    {"t": [6, 1, 1],   "r": [0, -np.pi/8,  0]},
+    {"t": [8, 0, 0],   "r": [0, -np.pi/8,  0]},
+    {"t": [10, -1, 1], "r": [0, -np.pi/8,  0]},
+    {"t": [12, 0, 0],  "r": [0, -np.pi/6,  0]},
+    {"t": [14, 1, 1],  "r": [0, -np.pi/6,  0]},
+    {"t": [16, 0, 0],  "r": [0, -np.pi/5,  0]},
+    {"t": [18, -1, 1], "r": [0, -np.pi/5,  0]},]
+    
+    # Getting the 10 init cam poses and axises (i will make it save the images for sfm if it's the first time)
+    init_o3d_cams_poses, init_o3d_cams_axises, images = set_init_cams(scene_mesh, init_o3d_cam_pose, motions, save=False)
+    all_o3d_images.append(images)
+    compos = [scene_mesh, init_o3d_cam_axis, *init_o3d_cams_axises]
+    visualize_scene(compos)
+
+    # getting desired o3d axis, i wanna get 
+    init_o3d_cam_pose, init_o3d_cam_axis = init_o3d_cams_poses[3], init_o3d_cams_axises[3]
+    des_o3d_cam_axis = init_o3d_cams_axises[8]
+
+
+
+    # --> SFM is done in this step before we continue
+
+
+    
+
+    # II)_____________Loading the gs-sfm scene : 
+    
+    # Loading gaussians from the ply :
+    means, quats, scales, opacities, sh = load_gaussians_from_ply(gs_path)
+
+    
+
+    # Loading the sfm-cameras (in w->c) and 3d points
+    recon = pycolmap.Reconstruction(sfm_recons_path)
+
+    # Loading the sfm cams will load the same ones above with the same names of images and their relative poses in sfm units
+    init_sfm_poses, init_sfm_axises = get_sfm_poses(recon)
+    print(init_sfm_poses)
+    xyz, colors, sfm_o3d_points = get_3dpoints(recon)
     z_mean = xyz[:, 2].mean()
     print("xyz shape", xyz.shape)
     print("colors shape", colors.shape)
     print("Average Z:", z_mean)
     print("Number of points:", xyz.shape[0])
 
-    compos = [*axises, o3dpoints]
+    compos = [*init_sfm_axises, sfm_o3d_points]
     visualize_scene(compos)
 
-
-    # getting init (cur_T) pose
-    _, cur_T = list(poses_imgs.items())[5]
+    
+    # choosing initial image 
+    cur_T = init_sfm_poses["8.png"]# as the first one in o3d which corresponds in sfm poses the 7th one
     # keeping cur_T in cf
     cur_T = np.linalg.inv(cur_T)
     #getting the depth map as avrg z of point
     depth_map = np.full((CAM_W, CAM_H), z_mean)
         
     # 3- rendering from a posed-cam as desired pose using gsplat (we get des_T in wf)
-    des_T = cur_T @ get_homog([0.7, 0.2, 0.1, np.pi/25, 0, 0])
-
+    des_T = init_sfm_poses["9.png"]
+    des_T = np.linalg.inv(des_T)
+    #des_T = cur_T @ get_homog([-1, -0.5, 0, 0, 0, 0])
 
     # turn it to wf then to torch
     des_viewmat = make_viewmat(des_T)
     des_img = render_view(means, quats, scales, opacities, sh, des_viewmat, Ks, CAM_W, CAM_H)
     gray_des = 0.299 * des_img[:, :, 0] + 0.587 * des_img[:, :, 1] + 0.114 * des_img[:, :, 2]
-    save_img(des_img, f"desired_img", "frames/fibvs_4matches")
+    save_img(des_img, f"desired_img", gs_frames_path)
 
     # Get keypoints from desired img
     des_kp, des_desc = get_features(des_img)
 
+    
+    # Intialize trajectory scene (sfm) : the visualizer with sfm cams and sfm 3d points
+    camera_centers_sfm = []
+    trajectory_line_sfm = o3d.geometry.LineSet()
+    sfm_vis = o3d.visualization.Visualizer()
+    des_cam_axis_sfm = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    des_cam_axis_sfm.transform(des_T)
+    cur_cam_axis_sfm = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    cur_cam_axis_sfm.transform(cur_T)
+    initialize_traject_visualizer(sfm_vis, trajectory_line_sfm, des_cam_axis_sfm, cur_cam_axis_sfm, cur_T, sfm_o3d_points)
+    prev_sfm_axis = None
+    
 
-     # Intialize trajectory scene : the visualizer with frames, mesh and line
-    camera_centers = []
-    trajectory_line = o3d.geometry.LineSet()
-    o3d_vis = o3d.visualization.Visualizer()
-    des_cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-    cur_cam_axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-    initialize_traject_visualizer(o3d_vis, trajectory_line, des_cam_axis, cur_cam_axis, des_T, o3dpoints)
-    prev_cur_frame = None
-
-
+    # Intialize trajectory scene (o3D) : the visualizer with o3d cams and o3d mesh 
+    camera_centers_o3d = []
+    trajectory_line_o3d = o3d.geometry.LineSet()
+    o3d_vis = o3d.visualization.Visualizer()    
+    initialize_traject_visualizer(o3d_vis, trajectory_line_o3d, init_o3d_cam_axis, init_o3d_cam_axis, init_o3d_cam_pose, scene_mesh)
+    prev_o3d_axis = None
 
 
 
     try:
         for i in range(999):
 
-
-            prev_cur_frame, scene_img = update_traject_visualizer(i, o3d_vis, trajectory_line, camera_centers, cur_T, prev_cur_frame)
+            prev_sfm_axis, scene_img_sfm = update_traject_visualizer(i, sfm_vis, trajectory_line_sfm, camera_centers_sfm, cur_T, prev_sfm_axis)
+            prev_o3d_axis, scene_img_o3d = update_traject_visualizer(i, o3d_vis, trajectory_line_o3d, camera_centers_o3d, init_o3d_cam_pose, prev_o3d_axis)
 
             # 1 - taking pic from cur_T (this function turn it to cf then torch for gsplat to use)
             cur_viewmat = make_viewmat(cur_T) 
             cur_img = render_view(means, quats, scales, opacities, sh, cur_viewmat, Ks, CAM_W, CAM_H)
             gray_cur = 0.299 * cur_img[:, :, 0] + 0.587 * cur_img[:, :, 1] + 0.114 * cur_img[:, :, 2]
-            #save_img(cur_img, i, "frames")
+            
 
             # getting cur features
             cur_kp, cur_des = get_features(cur_img)
@@ -660,6 +849,7 @@ def main() :
             if(i==0):
                 #making our matp visualizer
                 matp_vis = LiveOptimizationVisualizer(des_img, cur_img)
+                save_img(cur_img, i, "frames")
                 show = True
 
             cur_feats, des_feats, match_img, nbr_features = get_matches(nbr_features, cur_kp, cur_des, des_kp, des_desc, cur_img, des_img, show, i)
@@ -691,7 +881,8 @@ def main() :
 
             # Apply the velocity for dt and update cam pose
             cur_T = update_cam_pose(cur_T, V, dt)
-            matp_vis.update(i, scene_img, cur_img, current_diff_img, V, norm_of_error)
+            init_o3d_cam_pose = update_cam_pose(init_o3d_cam_pose, V, dt)
+            matp_vis.update(i, match_img, cur_img, current_diff_img, V, norm_of_error)
 
 
         matp_vis.close()

@@ -326,21 +326,25 @@ def save_img(img, title, folder_path) :
 
 def make_ply_from_points(xyz, rgb, ply_path, scale=0.01, alpha=0.95, sh_degree=2, device="cuda"):
     
-    # Flatten inputs
+    # Flatten points nd colors
     xyz_flat = xyz.reshape(-1, 3)
     rgb_flat = rgb.reshape(-1, 3)
     N = xyz_flat.shape[0]
 
-    # Normalize RGB if needed
+    # make sure colors are normalized to 0-1
     if rgb_flat.max() > 1.0:
         rgb_flat = rgb_flat / 255.0
     rgb_flat = np.clip(rgb_flat, 0.0, 1.0)
 
     # Opacity logit
+    opacity_logit = alpha
+                                                                                                    
+    """
     eps = 1e-6
     alpha_clamped = np.clip(alpha, eps, 1.0 - eps)
     opacity_logit = np.log(alpha_clamped / (1 - alpha_clamped))
-
+    """
+    
     # Scale in log-space
     scale_log = np.log(scale)
 
