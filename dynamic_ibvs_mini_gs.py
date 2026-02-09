@@ -726,6 +726,7 @@ def main() :
 
     # load the o3d mesh  
     scene_mesh = load_mesh(mesh_path, lambert=False)
+    visualize_scene([scene_mesh])
 
     # Defining our initial camera we set it manually inside the function
     init_o3d_cam_pose, init_o3d_cam_axis, init_o3d_img = set_init_cam(scene_mesh, save = False)
@@ -744,7 +745,7 @@ def main() :
     {"t": [12, 0, 0],  "r": [0, -np.pi/6,  0]},
     {"t": [14, 1, 1],  "r": [0, -np.pi/6,  0]},
     {"t": [16, 0, 0],  "r": [0, -np.pi/5,  0]},
-    {"t": [18, -1, 1], "r": [0, -np.pi/5,  0]},]
+    {"t": [18, -1, 1], "r": [0, -np.pi/5,  0]}]
     
     # Getting the 10 init cam poses and axises (i will make it save the images for sfm if it's the first time)
     init_o3d_cams_poses, init_o3d_cams_axises, images = set_init_cams(scene_mesh, init_o3d_cam_pose, motions, save=False)
@@ -755,7 +756,7 @@ def main() :
     # getting desired o3d axis, i wanna get 
     init_o3d_cam_pose, init_o3d_cam_axis = init_o3d_cams_poses[3], init_o3d_cams_axises[3]
     des_o3d_cam_axis = init_o3d_cams_axises[8]
-
+    
 
 
     # --> SFM is done in this step before we continue

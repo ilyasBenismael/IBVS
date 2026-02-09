@@ -5,20 +5,35 @@ import cv2
 import matplotlib.pyplot as plt
 import math
 import os
+from plyfile import PlyData, PlyElement
 from PIL import Image
 from datetime import datetime
 from utils.visualizer import LiveOptimizationVisualizer
 import torch
 from moge.model.v2 import MoGeModel
+from gsplat import rasterization
 import utils3d 
 
 
 
-CAM_W, CAM_H = 700, 600
+#ibvs params
+dt = 0.4
+lamda = 0.1
+
+#paths
+mesh_path = "meshes/office2.glb"
+o3d_frames_path = "frames/o3d"
+gs_frames_path = "frames/gs"
+moge_points_save_path = "moge_points/office2_0.ply"
+gs_save_path = "gs_scenes/init_gs_office2.ply"
+
+
+# robot camera
+CAM_W, CAM_H = 1200, 1000
 FX = FY = 0.8 * max(CAM_W, CAM_H)
 f=1
 CX, CY = CAM_W / 2.0, CAM_H / 2.0
-intrins = o3d.camera.PinholeCameraIntrinsic(
+intrins_o3d = o3d.camera.PinholeCameraIntrinsic(
     width=CAM_W,
     height=CAM_H,
     fx=FX,
@@ -26,18 +41,20 @@ intrins = o3d.camera.PinholeCameraIntrinsic(
     cx=CX,
     cy=CY
 )
-dt = 0.4
-lamda = 0.1
-mesh_path = "scenes/room_points_holes.ply"
-img_path = "imgs/office2_1.png"
-moge_points_save_path = "moge_points/office2.ply"
-moge_img_save_path = "imgs/masked_moge_office.png"
 
+intrins_gs = torch.tensor(
+    [[FX, 0.0, CX],
+        [0.0, FY, CY],
+        [0.0, 0.0, 1.0],],
+    dtype=torch.float32,
+    device="cuda",
+).unsqueeze(0)
 
+# whole scene visualizer camera
 CAM_W2, CAM_H2 = 400, 300
 FX2 = FY2 = 0.8 * max(CAM_W2, CAM_H2)
 CX2, CY2 = CAM_W2 / 2.0, CAM_H2 / 2.0
-intrins2 = o3d.camera.PinholeCameraIntrinsic(
+intrins2_o3d = o3d.camera.PinholeCameraIntrinsic(
     width=CAM_W2,
     height=CAM_H2,
     fx=FX2,
@@ -51,6 +68,43 @@ np.set_printoptions(precision=2, suppress=False)
 
 
 
+def load_np_img(img_path) :
+    img = Image.open(img_path).convert("RGB")
+    return np.array(img)
+
+
+def visualize_scene(scene_compos) :
+        o3d.visualization.draw_geometries(
+        scene_compos,
+        window_name="The scene",
+        width=800,
+        height=800,
+        mesh_show_back_face=True)
+
+
+
+def get_cam_pose_from_mesh_view(mesh):
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Choose ur pose", width=800, height=800)
+    vis.add_geometry(mesh)
+    vis.get_render_option().mesh_show_back_face = True
+    print("choose ur pose and close window")
+    
+    vis.run()
+    
+    # Get camera parameters
+    vc = vis.get_view_control()
+    cam_params = vc.convert_to_pinhole_camera_parameters()
+    
+    # Extract pose turn if frm wrld relative to cam into cam relative to world 
+    T_wc = cam_params.extrinsic  
+    T_cw = np.linalg.inv(T_wc)
+
+    vis.destroy_window()
+    return T_cw
+
+
 
 
 def get_homog(pose_vector) :
@@ -61,19 +115,18 @@ def get_homog(pose_vector) :
 
 
 
-def load_mesh(path, lambert) :
+def load_mesh(path, scale, lambert) :
     
     # loading the mesh, enable post to render the colored texture, (no normals for lambertian)
     mesh = o3d.io.read_triangle_mesh(path, enable_post_processing=True)
     print(f"Number of vertices: {len(mesh.vertices)}")
 
-    
     if(not lambert) :
         mesh.compute_vertex_normals()  
 
     # center the mesh, and scaling it
     mesh.translate(-mesh.get_center()) 
-    mesh.scale(3 , center=mesh.get_center()) 
+    mesh.scale(scale , center=mesh.get_center()) #this center is just about mesh position after scaling (keepin it in the center here)
 
     return mesh 
 
@@ -97,87 +150,48 @@ def move_points_with_camera(points_world, T_wc):
 
 
 
+def get_moge_points(img, threshold=0.01):
 
-
-def load_points(img_path, cam_homog, threshold=0.01):
-
-    # Load MoGe
     device = "cuda"
     model = MoGeModel.from_pretrained(
         "Ruicheng/moge-2-vitl-normal"
     ).to(device)
     model.eval()
 
-    # Load RGB image
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    H, W = img.shape[:2]
+  
+    if img.max() > 1.0:
+        img = img / 255.0
 
-    image = torch.tensor(
-        img / 255.0,
-        dtype=torch.float32,
-        device=device
-    ).permute(2, 0, 1)
+    # img is already in [0,1], RGB
+    image = torch.from_numpy(img) \
+        .float() \
+        .to(device) \
+        .permute(2, 0, 1)
 
-    # Run MoGe inference
     output = model.infer(image)
-    points = output["points"].cpu().numpy()  # (H, W, 3)
-    depth  = output["depth"].cpu().numpy()   # (H, W)
-    mask   = output["mask"].cpu().numpy()    # (H, W) bool
 
-    # give true for edge pixels
-    edge_mask = utils3d.np.depth_map_edge(
-        depth,
-        rtol=threshold
-    )
+    points = output["points"].cpu().numpy()
+    depth  = output["depth"].cpu().numpy()
+    mask   = output["mask"].cpu().numpy()
 
-    # final mask made of (valid pixels) and (non-edgepixels)
+    edge_mask = utils3d.np.depth_map_edge(depth, rtol=threshold)
     mask_cleaned = mask & (~edge_mask)
 
-    # Transform the points next to the camera (change the xyz_s)
-    points_cam = move_points_with_camera(points, cam_homog)
-
-    # Prepare and flatten colors, points, and masks
-    colors = img.astype(np.float32) / 255.0   # (H, W, 3)
-    pts_flat    = points_cam.reshape(-1, 3)
+    # ---- IMPORTANT PART ----
+    colors = img.astype(np.float64)
+    pts_flat    = points.reshape(-1, 3).astype(np.float64)
     colors_flat = colors.reshape(-1, 3)
-    valid_flat  = mask_cleaned.reshape(-1) > 0
+    valid_flat  = mask_cleaned.reshape(-1)
 
-    # Create Open3D point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_flat[valid_flat])
-    pcd.colors = o3d.utility.Vector3dVector(colors_flat[valid_flat])
+    final_points = pts_flat[valid_flat]
+    final_colors = colors_flat[valid_flat]
 
-    o3d.io.write_point_cloud(
-        moge_points_save_path,
-        pcd
-    )
+    o3d_points = o3d.geometry.PointCloud()
+    o3d_points.points = o3d.utility.Vector3dVector(final_points)
+    o3d_points.colors = o3d.utility.Vector3dVector(final_colors)
+    o3d.io.write_point_cloud(moge_points_save_path, o3d_points)
 
-    # ==================================================
-    # NEW PART 1: RGBA image with masked pixels removed
-    # ==================================================
-    alpha = (mask_cleaned.astype(np.uint8) * 255)  # (H, W)
-
-    rgba_image = np.dstack([
-        img,     # R
-        alpha    # A
-    ])  # (H, W, 4)
-
-    # Optional save
-    cv2.imwrite(
-        moge_img_save_path,
-        cv2.cvtColor(rgba_image, cv2.COLOR_RGBA2BGRA)
-    )
-
-    # ==================================================
-    # NEW PART 2: masked points (N, 3)
-    # ==================================================
-    masked_points = pts_flat[valid_flat]
-
-    return pcd, rgba_image, masked_points
-
-
-
+    return o3d_points, final_points, final_colors
 
 
 
@@ -210,76 +224,40 @@ def set_cameras(cur_pose_vect) :
 
 
 
-
-def visualize_scene(scene_compos):
-    vis = o3d.visualization.VisualizerWithEditing()
-    vis.create_window(
-        window_name="The scene",
-        width=800,
-        height=800
-    )
-
-    for g in scene_compos:
-        vis.add_geometry(g)
-
+def get_camera_pose_from_mesh(mesh):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Set Camera View", width=800, height=800)
+    vis.add_geometry(mesh)
     vis.get_render_option().mesh_show_back_face = True
-
-    print("Navigate with mouse.")
-    print("Shift + Left Click to pick points (pick 2 to measure distance).")
-    print("Close window or press Q when done.")
-
-    vis.run()  # user interaction happens here
-
-    # ---------------------------
-    # Camera pose
-    # ---------------------------
+    
+    print("Navigate to desired view.")
+    print("Close window when done.")
+    
+    vis.run()
+    
+    # Get camera parameters
     vc = vis.get_view_control()
     cam_params = vc.convert_to_pinhole_camera_parameters()
-
-    # world -> camera
-    T_wc = cam_params.extrinsic
-
-    # camera -> world
-    T_cw = np.linalg.inv(T_wc)
-
-    # ---------------------------
-    # Distance computation
-    # ---------------------------
-    picked_ids = vis.get_picked_points()
-    distance = 0.0
-
-    if len(picked_ids) >= 2:
-        # Use first geometry that has vertices / points
-        geom = scene_compos[0]
-
-        if isinstance(geom, o3d.geometry.PointCloud):
-            pts = np.asarray(geom.points)
-        elif isinstance(geom, o3d.geometry.TriangleMesh):
-            pts = np.asarray(geom.vertices)
-        else:
-            pts = None
-
-        if pts is not None:
-            p1 = pts[picked_ids[0]]
-            p2 = pts[picked_ids[1]]
-            distance = float(np.linalg.norm(p1 - p2))
-
+    
+    # Extract pose: camera to world
+    T_wc = cam_params.extrinsic  # world to camera
+    T_cw = np.linalg.inv(T_wc)    # camera to world
+    
     vis.destroy_window()
-
-    return T_cw, distance
+    return T_cw
 
 
 
 
     
-def takin_pic(mesh, extrins):
+def render_mesh_pic(mesh, extrins):
 
     # defining extrins and T_cw_final params 
     extrins = np.linalg.inv(extrins)
 
     # making our pincamparams objct
     cam_params = o3d.camera.PinholeCameraParameters()
-    cam_params.intrinsic = intrins
+    cam_params.intrinsic = intrins_o3d
     cam_params.extrinsic = extrins
 
     # ---------- Create visualizer ----------
@@ -313,6 +291,26 @@ def plot_img(des_img, title) :
     plt.imshow(des_img)
     plt.axis("off")
     plt.suptitle(title)
+    plt.show()
+
+
+
+
+def plot_2_imgs(img1, img2, title1="", title2="", suptitle=None):
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+
+    axs[0].imshow(img1)
+    axs[0].axis("off")
+    axs[0].set_title(title1)
+
+    axs[1].imshow(img2)
+    axs[1].axis("off")
+    axs[1].set_title(title2)
+
+    if suptitle is not None:
+        fig.suptitle(suptitle)
+
+    plt.tight_layout()
     plt.show()
 
 
@@ -498,7 +496,7 @@ def initialize_traject_visualizer(vis, trajectory_line, des_cam_axis, cur_cam_ax
 
     # Create Open3D camera parameters
     cam_params = o3d.camera.PinholeCameraParameters()
-    cam_params.intrinsic = intrins2
+    cam_params.intrinsic = intrins2_o3d
     cam_params.extrinsic = pov_extrins
 
     # Apply camera to visualizer
@@ -582,58 +580,252 @@ def compute_grayscale_difference(img1, img2, normalize=True):
 
 
 
+def start_dvs_loop(iterations, des_img) : 
+
+    for i in range(iterations) :
+        
+        if i== 0:
+            gray_des = 0.299 * des_img[:, :, 0] + 0.587 * des_img[:, :, 1] + 0.114 * des_img[:, :, 2]
+            S_star = gray_des.flatten()
+
+
+
+
+
+
+
+def get_gs_viewmat(T, device="cuda"):
+    # Taking normal pose (cam relative to wrld) and turn it to (wrld telative to cam)
+    T = torch.tensor(T, dtype=torch.float32, device=device)
+    viewmat = torch.linalg.inv(T)
+    return viewmat.unsqueeze(0)
+
+
+
+
+
+
+def init_gaussians_from_points(
+    xyz,
+    rgb,
+    ply_path,
+    scale=0.007,
+    alpha=0.1,
+    sh_degree=2,
+    device="cuda",
+):
+
+
+    # Flatten inputs
+    xyz = xyz.reshape(-1, 3)
+    rgb = rgb.reshape(-1, 3)
+    N = xyz.shape[0]
+
+    # Normalize moge_colors
+    if rgb.max() > 1.0:
+        rgb = rgb / 255.0
+
+
+    # Get f_dc from rgb
+    f_dc = (rgb - 0.5) / 0.28209479177387814
+
+    # Defining the nmbr of sh coeffs
+    num_sh = (sh_degree + 1) ** 2
+
+    #______ init opacity
+    # Ok in gs we have the opacity the value we optimize and which we use inside a sigmoid to turn to 0-1, gsplat use the 0-1 one (for render), ply idk wht it stores
+    opacity_logit = np.log(alpha / (1 - alpha))
+
+    #______ init opacity
+    # when optimizing the scale we do exp(scale) so it is always positive, but ply wants the log value (optimized one) and the gsplat want the exp one (render one)
+    scale_log = np.log(scale)
+
+
+    # ______PLY file structure (GS-compatible)
+    
+    dtype = [
+        ("x", "f4"), ("y", "f4"), ("z", "f4"),          # Gaussian center
+        ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),       # Unused normals
+        ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),  # SH DC
+        ("opacity", "f4"),                              # Opacity logit
+        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),  # log-scales
+        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),  # quaternion
+    ]
+
+    # Higher-order SH coefficients set to 0
+    for i in range(num_sh - 1):
+        for c in range(3):
+            dtype.append((f"f_rest_{3*i + c}", "f4"))
+
+    data = np.empty(N, dtype=dtype)
+
+
+
+    #____________  Fill PLY data
+
+    # Positions
+    data["x"], data["y"], data["z"] = xyz.T
+
+    # Normals are unused by GS → set to zero
+    data["nx"] = data["ny"] = data["nz"] = 0.0
+
+    # SH DC coefficients
+    data["f_dc_0"] = f_dc[:, 0]
+    data["f_dc_1"] = f_dc[:, 1]
+    data["f_dc_2"] = f_dc[:, 2]
+
+    # Opacity
+    data["opacity"] = opacity_logit
+
+    # Scales
+    data["scale_0"] = scale_log
+    data["scale_1"] = scale_log
+    data["scale_2"] = scale_log
+
+    # Identity rotation quaternion
+    data["rot_0"] = 1.0
+    data["rot_1"] = 0.0
+    data["rot_2"] = 0.0
+    data["rot_3"] = 0.0
+
+    # Higher-order SH coefficients start at zero
+    for i in range(num_sh - 1):
+        for c in range(3):
+            data[f"f_rest_{3*i + c}"] = 0.0
+
+    # Save ply file
+    PlyData([PlyElement.describe(data, "vertex")]).write(ply_path)
+
+
+    # Turn these gaussians properties to tensors
+    means = torch.from_numpy(xyz).float().to(device)
+    scales = torch.full((N, 3), scale, device=device)
+    quats = torch.zeros((N, 4), device=device)
+    quats[:, 0] = 1.0  # identity rotation
+    opacities = torch.full((N,), alpha, device=device)
+
+    # SH tensor layout: [N, num_sh, 3]
+    sh = torch.zeros((N, num_sh, 3), device=device)
+    sh[:, 0, :] = torch.from_numpy(f_dc).to(device)
+
+
+    return means, quats, scales, opacities, sh
+
+
+
+
+
+
+
+
+
+def render_gs_pic(means, quats, scales, opacities, sh, T, K, W, H):
+    
+    image, alpha, meta = rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=sh,
+        viewmats=T,
+        Ks=K,
+        width=W,
+        height=H,
+        sh_degree=2,              
+        rasterize_mode="antialiased",
+        render_mode="RGB",
+    )
+
+    # we get the only img in the batch with image[0], we move the tensor to cpu nd turn it to numpy
+    img = image[0].detach().cpu().numpy()
+
+    return img
+
+
+
+
+
+
+
+
 
 #____________________________________________________________________________________
 
 
+
+
 def main() :
-
-    moge_treshhold = 0.01
-    pcd = o3d.io.read_point_cloud(mesh_path)
-    pcd.normals = o3d.utility.Vector3dVector([])
-    mesh = pcd
-    omesh = load_mesh(mesh_path, False)
     
-    # setup init nd desired homog matrices nd axises
-    #cur_pose_vect = [2, 0, -2, 0, 0, 0]  
-    #cur_extrins, des_extrins, des_cam_axis, cur_cam_axis = set_cameras(cur_pose_vect)
+    # Scale the mesh to meters, for office_2 nearly 1 meter corresp to 4 units
+    scale = (1/4) 
+
+    # Load a 3d mesh nearly in meters
+    mesh = load_mesh(mesh_path, scale, False)
+
+    # Visualize and choose an initial pose || use the saved one
+    """init_pose = get_cam_pose_from_mesh_view(mesh)
+    np.save("init_pose.npy", init_pose)"""
+    init_pose = np.load("init_pose.npy")
+
+    # Move init_pose to origin
+    mesh.transform(np.linalg.inv(init_pose))
+    init_pose = np.eye(4)
+
+
+    # Take initial mesh pic || load the saved one
+    """mesh_init_img, init_depth = render_mesh_pic(mesh, init_pose)
+    save_img(mesh_init_img, 0, o3d_frames_path)"""
+    mesh_init_img = load_np_img(f"{o3d_frames_path}/0.png")
+    plot_img(mesh_init_img, "init_img")
+
+
+    # Apply moge on the init real img || load ready mogepoints
+    """points_o3d, moge_points, moge_colors = get_moge_points(mesh_init_img) # moge scene dist from cam is not accurate
+    np.save("moge_points.npy", moge_points)
+    np.save("moge_colors.npy", moge_colors)"""
+    moge_points = np.load("moge_points.npy")
+    moge_colors = np.load("moge_colors.npy")
+    points_o3d = o3d.io.read_point_cloud(moge_points_save_path)
+    visualize_scene([points_o3d, mesh])    
+
+    # Getting a des_pose from real mesh and plotting it
+    gs_des_pose = get_cam_pose_from_mesh_view(points_o3d)
+
+    # Init gaussians from moge_points & Rendering gs initial pose img 
+    gaussians_list = init_gaussians_from_points(moge_points, moge_colors, gs_save_path)
+    init_viewmat = get_gs_viewmat(init_pose)
+    gs_init_img = render_gs_pic(*gaussians_list, T=init_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
+    save_img(gs_init_img, 0, gs_save_path)
+    
+    # Render des_img from gaussians and mesh
+    des_viewmat = get_gs_viewmat(gs_des_pose)
+    gs_des_img = render_gs_pic(*gaussians_list, T=des_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
+    mesh_des_img, _  = render_mesh_pic(mesh, gs_des_pose)  
+    plot_2_imgs(mesh_des_img, gs_des_img, "mesh_des_img",  "gs_des_img")
+    plot_2_imgs(gs_init_img, gs_des_img, "gs_init_img",  "gs_des_img")
+    save_img(mesh_des_img, "desired", o3d_frames_path)
+    save_img(gs_des_img, "desired", gs_frames_path)
 
     
-    # Defining desired cam T 
-    des_extrins = get_homog([0, 0, 0, 0, 0, 0])
+    return
 
-    # defining initial cam T
-    T_1 = get_homog([0.3, -0.2, 0, 0, 0, 0]) #near
-    #T_1 = get_homog([2.2, 0, -2, 0, 0, 0]) #far
-    cur_extrins = des_extrins @ T_1
+    
 
-    # get init 3d points from img with moge nd translate them to cur_cam frame
-    points,_,_ = load_points(img_path, cur_extrins, moge_treshhold)
-    extrins = np.array([
-    [-0.78,  0.28, -0.55,  0.85],
-    [ 0.25,  0.96,  0.13, -0.16],
-    [ 0.57, -0.03, -0.82,  1.86],
-    [ 0,    0,    0,    1  ]
-    ], dtype=np.float64)
+    start_dvs_loop(iterations = 999, des_img = mesh_des_img,  )
+    # using a very clean code
+    # apply dvs, dyna and stat ibvs on both scenes (navigate and render in both scenes use correct depth and avg depth)
+    # turn to gaussians, and redo same thing
+    # turn real poses to colmap and improve gaussians
 
-    extrins, dist = visualize_scene([points, omesh])
-    print("dist", dist)
-    img, _ = takin_pic(points, extrins)
-    plot_img(img, "yes")
-    #mesh = points
+
+    #visualize the mesh and return des_pose 
+    #render des pose in o3d nd moge to compare 
+
 
 
     return
 
     
-    # taking pic from des_cam
-    des_img, des_depth = takin_pic(mesh, des_extrins)
-    plot_img(des_img, "desired_image")
-    plot_img(des_depth, "desired_depthMap")
-    save_img(des_img, "des", "frames")
-    gray_des = 0.299 * des_img[:, :, 0] + 0.587 * des_img[:, :, 1] + 0.114 * des_img[:, :, 2]
-    S_star = gray_des.flatten()
-
 
     # intialize trajectory scene : the visualizer with frames, mesh and line
     camera_centers = []
