@@ -101,7 +101,7 @@ class LinAlgeb :
     # ------------- Direct transform frame of a point using homog matrix -------------------
 
     @staticmethod
-    def transform_forward(p_in_cam: List[Sequence[float]],
+    def transform_points_to_world(p_in_cam: List[Sequence[float]],
                         cam_homog : np.ndarray) -> List[float]:
         
         # (Camera -> World)
@@ -113,13 +113,13 @@ class LinAlgeb :
         for p in p_in_cam:
             Rp = LinAlgeb.matvec3(cam_rot, p)
             points_c.append(LinAlgeb.vec_add(Rp, cam_trans))
-        return points_c
+        return np.array(points_c) 
 
 
     # ------------ Inverse transform frame of a point using homog matrix --------------------  
      
     @staticmethod 
-    def transform_inverse(p_in_world: List[Sequence[float]],
+    def transform_points_to_cam(p_in_world: List[Sequence[float]],
                         cam_homog : np.ndarray) -> List[float]:
 
         # (in World -> in Camera)
@@ -130,7 +130,54 @@ class LinAlgeb :
         for p in p_in_world:
             diff = LinAlgeb.vec_sub(p, cam_trans)
             points_c.append(LinAlgeb.matvec3(LinAlgeb.RT(cam_rot), diff))
-        return points_c    
+        return np.array(points_c)    
 
 
+
+
+    @staticmethod
+    def print_mat_condition_number(A):
+
+        A = np.asarray(A)
+
+        # ---- Fix IBVS stacked format (n,2,6) -> (2n,6)
+        if A.ndim == 3:
+            if A.shape[1] == 2:
+                A = A.reshape(-1, A.shape[-1])
+            else:
+                raise ValueError("Unsupported 3D matrix shape")
+
+        # ---- Ensure 2D matrix
+        if A.ndim != 2:
+            raise ValueError("Input must be a 2D matrix")
+
+        # ---- Compute condition number
+        cond_number = np.linalg.cond(A)
+
+        # ---- Interpret result
+        if np.isinf(cond_number):
+            meaning = "Singular (rank deficient)"
+
+        elif cond_number < 10:
+            meaning = "Excellent conditioning"
+
+        elif cond_number < 100:
+            meaning = "Good conditioning"
+
+        elif cond_number < 1e3:
+            meaning = "Acceptable"
+
+        elif cond_number < 1e5:
+            meaning = "Unstable"
+
+        elif cond_number < 1e7:
+            meaning = "Very unstable"
+
+        elif cond_number < 1e8:
+            meaning = "Severely ill-conditioned"
+
+        else:
+            meaning = "Almost linearly dependent"
+
+        print(f"{meaning}, {cond_number}")
 

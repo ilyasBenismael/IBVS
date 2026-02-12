@@ -5,18 +5,14 @@ import matplotlib.patches as patches
 
 class LiveOptimizationVisualizer:
 
-    def __init__(self, desired_img, initial_img):
-        self.desired_img = desired_img
+    def __init__(self, initial_img):
         self.initial_img = initial_img
         
         # Storage for history
         self.iterations = []
         self.losses = []
         self.velocities = []  # List of [vx, vy, vz, wx, vy, wz]
-        
-        # Compute initial difference
-        self.initial_diff = self.compute_grayscale_difference(desired_img, initial_img)
-        
+               
         # Setup figure with adjusted layout
         self.fig = plt.figure(figsize=(16, 12))
         gs = self.fig.add_gridspec(2, 2, height_ratios=[1, 1.5], hspace=0.3, wspace=0.3)
@@ -25,8 +21,8 @@ class LiveOptimizationVisualizer:
         self.ax_vel = self.fig.add_subplot(gs[0, 0])
         self.ax_loss = self.fig.add_subplot(gs[0, 1])
         
-        # Bottom row: scene image (left) and comparison grid (right)
-        self.ax_scene = self.fig.add_subplot(gs[1, 0])
+        # Bottom row: diff image (left) and comparison grid (right)
+        self.ax_diff= self.fig.add_subplot(gs[1, 0])
         self.ax_comparison = self.fig.add_subplot(gs[1, 1])
         
         # Initialize plots
@@ -94,12 +90,12 @@ class LiveOptimizationVisualizer:
         self.ax_loss.grid(True, alpha=0.3)
         self.loss_line, = self.ax_loss.plot([], [], 'b-')
 
-        # ===== Scene =====
-        self.ax_scene.set_title('SIFT matches')
-        self.ax_scene.axis('off')
-        self.scene_img_plot = None
+        # ===== diff =====
+        self.ax_diff.set_title('Diff')
+        self.ax_diff.axis('off')
+        self.diff_img_plot = None
 
-        # ===== Replace ax_comparison with nested GridSpec =====
+        # ===== Nested GridSpec, the 4 subbplot inside the big 4 plots =====
         parent_spec = self.ax_comparison.get_subplotspec()
         self.ax_comparison.remove()
 
@@ -107,27 +103,28 @@ class LiveOptimizationVisualizer:
 
         self.ax_img_cur = self.fig.add_subplot(gs_inner[0, 0])
         self.ax_img_des = self.fig.add_subplot(gs_inner[0, 1])
-        self.ax_img_init = self.fig.add_subplot(gs_inner[1, 0])
-        self.ax_img_diff = self.fig.add_subplot(gs_inner[1, 1])
+        self.ax_img_real = self.fig.add_subplot(gs_inner[1, 0])
+        self.ax_img_init = self.fig.add_subplot(gs_inner[1, 1])
 
-        for ax in (self.ax_img_cur, self.ax_img_des, self.ax_img_init, self.ax_img_diff):
+        for ax in (self.ax_img_cur, self.ax_img_des, self.ax_img_real, self.ax_img_init):
             ax.axis('off')
 
         self.ax_img_cur.set_title("Current")
         self.ax_img_des.set_title("Desired")
+        self.ax_img_real.set_title("Real")
         self.ax_img_init.set_title("Initial")
-        self.ax_img_diff.set_title("Difference")
 
         self.img_cur_plot = None
         self.img_des_plot = None
+        self.img_real_plot = None
         self.img_init_plot = None
-        self.img_diff_plot = None
+        
 
 
 
 
-
-    def update(self, iteration, scene_img, current_img, diff_img, velocity, loss):
+#i will have current , desired, initial, real
+    def update(self, iteration, diff_img, current_img, real_img, des_img, velocity, loss):
 
         self.iterations.append(iteration)
         self.losses.append(loss)
@@ -144,25 +141,27 @@ class LiveOptimizationVisualizer:
         self.ax_loss.relim()
         self.ax_loss.autoscale_view()
 
-        # ----- scene -----
-        if self.scene_img_plot is None:
-            self.scene_img_plot = self.ax_scene.imshow(scene_img)
+        # ----- diff -----
+        if self.diff_img_plot is None:
+            self.diff_img_plot = self.ax_diff.imshow(diff_img)
         else:
-            self.scene_img_plot.set_data(scene_img)
+            self.diff_img_plot.set_data(diff_img)
+
 
         # ----- images -----
         if self.img_cur_plot is None:
             self.img_cur_plot = self.ax_img_cur.imshow(current_img)
-            self.img_des_plot = self.ax_img_des.imshow(self.desired_img)
+            self.img_des_plot = self.ax_img_des.imshow(des_img)
+            self.img_real_plot = self.ax_img_real.imshow(real_img)
             self.img_init_plot = self.ax_img_init.imshow(self.initial_img)
-            self.img_diff_plot = self.ax_img_diff.imshow(diff_img, cmap='gray')
         else:
+            
             self.img_cur_plot.set_data(current_img)
-            self.img_diff_plot.set_data(diff_img)
+            self.img_des_plot.set_data(des_img)
+            self.img_real_plot.set_data(real_img)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
-
 
 
 

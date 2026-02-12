@@ -714,13 +714,7 @@ def init_gaussians_from_points(
 
 
 
-
-
-
-
-
 def render_gs_pic(means, quats, scales, opacities, sh, T, K, W, H):
-    
     image, alpha, meta = rasterization(
         means=means,
         quats=quats,
@@ -731,15 +725,17 @@ def render_gs_pic(means, quats, scales, opacities, sh, T, K, W, H):
         Ks=K,
         width=W,
         height=H,
-        sh_degree=2,              
+        sh_degree=2,
         rasterize_mode="antialiased",
-        render_mode="RGB",
+        render_mode="RGB+ED",
     )
 
-    # we get the only img in the batch with image[0], we move the tensor to cpu nd turn it to numpy
-    img = image[0].detach().cpu().numpy()
+    img   = image[0, ..., :-1].detach().cpu().numpy() 
+    depth = image[0, ..., -1].detach().cpu().numpy() 
 
-    return img
+    return img, depth
+
+
 
 
 
@@ -773,88 +769,63 @@ def main() :
 
 
     # Take initial mesh pic || load the saved one
-    """mesh_init_img, init_depth = render_mesh_pic(mesh, init_pose)
-    save_img(mesh_init_img, 0, o3d_frames_path)"""
-    mesh_init_img = load_np_img(f"{o3d_frames_path}/0.png")
-    plot_img(mesh_init_img, "init_img")
+    """init_mesh_img, init_depth = render_mesh_pic(mesh, init_pose)
+    save_img(init_mesh_img, 0, o3d_frames_path)"""
+    init_mesh_img = load_np_img(f"{o3d_frames_path}/0.png")
+    #plot_img(init_mesh_img, "init_img")
 
 
     # Apply moge on the init real img || load ready mogepoints
-    """points_o3d, moge_points, moge_colors = get_moge_points(mesh_init_img) # moge scene dist from cam is not accurate
+    """points_o3d, moge_points, moge_colors = get_moge_points(init_mesh_img) # moge scene dist from cam is not accurate
     np.save("moge_points.npy", moge_points)
     np.save("moge_colors.npy", moge_colors)"""
     moge_points = np.load("moge_points.npy")
     moge_colors = np.load("moge_colors.npy")
     points_o3d = o3d.io.read_point_cloud(moge_points_save_path)
-    visualize_scene([points_o3d, mesh])    
+    #visualize_scene([points_o3d, mesh])    
 
     # Getting a des_pose from real mesh and plotting it
     gs_des_pose = get_cam_pose_from_mesh_view(points_o3d)
+    mesh_des_pose = get_cam_pose_from_mesh_view(mesh)
 
     # Init gaussians from moge_points & Rendering gs initial pose img 
     gaussians_list = init_gaussians_from_points(moge_points, moge_colors, gs_save_path)
     init_viewmat = get_gs_viewmat(init_pose)
-    gs_init_img = render_gs_pic(*gaussians_list, T=init_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
-    save_img(gs_init_img, 0, gs_save_path)
+    init_gs_img, gs_init_depth = render_gs_pic(*gaussians_list, T=init_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
+    save_img(init_gs_img, 0, gs_save_path)
     
     # Render des_img from gaussians and mesh
     des_viewmat = get_gs_viewmat(gs_des_pose)
-    gs_des_img = render_gs_pic(*gaussians_list, T=des_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
-    mesh_des_img, _  = render_mesh_pic(mesh, gs_des_pose)  
-    plot_2_imgs(mesh_des_img, gs_des_img, "mesh_des_img",  "gs_des_img")
-    plot_2_imgs(gs_init_img, gs_des_img, "gs_init_img",  "gs_des_img")
-    save_img(mesh_des_img, "desired", o3d_frames_path)
-    save_img(gs_des_img, "desired", gs_frames_path)
-
-    
-    return
+    des_gs_img, _ = render_gs_pic(*gaussians_list, T=des_viewmat, K=intrins_gs, W=CAM_W, H=CAM_H)
+    des_mesh_img, _  = render_mesh_pic(mesh, mesh_des_pose)  
+    plot_2_imgs(init_mesh_img, des_mesh_img, "init_mesh_img",  "des_mesh_img")
+    save_img(des_mesh_img, "desired", o3d_frames_path)
+    save_img(des_gs_img, "desired", gs_frames_path)
 
     
 
-    start_dvs_loop(iterations = 999, des_img = mesh_des_img,  )
-    # using a very clean code
-    # apply dvs, dyna and stat ibvs on both scenes (navigate and render in both scenes use correct depth and avg depth)
-    # turn to gaussians, and redo same thing
-    # turn real poses to colmap and improve gaussians
-
-
-    #visualize the mesh and return des_pose 
-    #render des pose in o3d nd moge to compare 
-
-
-
-    return
-
     
-
-    # intialize trajectory scene : the visualizer with frames, mesh and line
-    camera_centers = []
-    trajectory_line = o3d.geometry.LineSet()
-    o3d_vis = o3d.visualization.Visualizer()
-    #initialize_traject_visualizer(o3d_vis, trajectory_line, des_cam_axis, cur_cam_axis, des_extrins, mesh)
-    prev_cur_frame = None
 
 
 
 
     #____________________________________________________________________________________
 
-    # Closed-loop
+    # DVS-Closed-loop
     try:
         for i in range(999):
 
-            # 0 - Update visualizer of trajects
-            #prev_cur_frame, scene_img = update_traject_visualizer(i, o3d_vis, trajectory_line, camera_centers, cur_extrins, prev_cur_frame)
+            if (i==0) :
+                cur_pose = init_pose
+                matp_vis = LiveOptimizationVisualizer(des_mesh_img, init_mesh_img)
+                gray_des = 0.299 * des_mesh_img[:, :, 0] + 0.587 * des_mesh_img[:, :, 1] + 0.114 * des_mesh_img[:, :, 2]
+                S_star = gray_des.flatten()
 
             # 1 - Capture current img nd get S
-            cur_img, cur_depth_map = takin_pic(mesh, cur_extrins)
-            save_img(cur_img, i, "frames")
-            gray_cur = 0.299 * cur_img[:, :, 0] + 0.587 * cur_img[:, :, 1] + 0.114 * cur_img[:, :, 2]
+            cur_mesh_img, cur_mesh_depth = render_mesh_pic(mesh, cur_pose)
+            save_img(cur_mesh_img, i, o3d_frames_path)
+            gray_cur = 0.299 * cur_mesh_img[:, :, 0] + 0.587 * cur_mesh_img[:, :, 1] + 0.114 * cur_mesh_img[:, :, 2]
             S = gray_cur.flatten()
-
-            # make our matplotlib vis
-            if(i==0) :
-                matp_vis = LiveOptimizationVisualizer(des_img, cur_img)
 
 
             # 2 - Compute the cost and the diff img for visua
@@ -865,15 +836,15 @@ def main() :
 
             # 3 - Compute Gradient and Ls 
             grad_Ix, grad_Iy = get_grads_visp(gray_cur)
-            Ls = compute_image_interaction_matrix(cur_depth_map, grad_Ix, grad_Iy)
+            Ls = compute_image_interaction_matrix(cur_mesh_depth, grad_Ix, grad_Iy)
 
 
             # 4- scaling the v based on our pose
-            if cost > 10000 :  
-                max_val = 0.1 
+            if cost > 40000 :  
+                max_val = 0.02 
                 mu = 999999   
-            elif cost > 6000 :  
-                max_val = 0.1 
+            elif cost > 10000 :  
+                max_val = 0.01 
                 mu=999999 
             elif cost > 500 :  
                 max_val = 0.01  
@@ -894,16 +865,14 @@ def main() :
 
             
             # 6 - Update camera pose & update matplotlib vis data
-            cur_extrins = update_cam_pose(cur_extrins, V, dt)
-            #matp_vis.update(i, scene_img, cur_img, current_diff_img, V,  cost)
+            cur_pose = update_cam_pose(cur_pose, V, dt)
+            matp_vis.update(i, cur_mesh_img, cur_mesh_img, current_diff_img, V,  cost)
 
         matp_vis.close()
-        o3d_vis.close()
 
     except KeyboardInterrupt:
         print("\nCtrl+C detected, exiting loop cleanly.")
         matp_vis.close()
-        o3d_vis.close()
         os._exit(0)
 
 
