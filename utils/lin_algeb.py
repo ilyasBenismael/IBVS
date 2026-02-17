@@ -181,3 +181,12 @@ class LinAlgeb :
 
         print(f"{meaning}, {cond_number}")
 
+
+    @staticmethod
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    @staticmethod
+    def inverse_sigmoid(y):
+        # y must be in (0, 1)
+        return np.log(y / (1 - y))
